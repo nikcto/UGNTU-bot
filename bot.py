@@ -17,7 +17,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = "YOUR_BOT_TOKEN_HERE"
+TOKEN = "8660024020:AAFijdCAcBUKkMKGebmAhYeMtkHsTKJJTuA"
 
 
 def parse_date(date_str: str) -> datetime:
