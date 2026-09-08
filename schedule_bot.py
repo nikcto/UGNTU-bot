@@ -18,15 +18,17 @@ from datetime import date, datetime, timedelta, timezone
 from hashlib import md5
 
 import requests
+from dotenv import load_dotenv
 from icalendar import Calendar, Event
+
+load_dotenv()  # локально подхватит .env; на Railway файла нет — просто ничего не делает
 
 # --- конфиг ---
 
-SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]  # sb_secret_...
+SUPABASE_URL = "https://pobepdbenznpdpgobwli.supabase.co".rstrip("/")
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBvYmVwZGJlbnpucGRwZ29id2xpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4ODg4ODk3MywiZXhwIjoyMTA0NDY0OTczfQ.pFrVaNnhvN0F7mcfrJ1iQEVwVkoizDmwwhBVt0t-5gg"
 BUCKET = "calendar"
 FILENAME = "schedule.ics"
-
 BASE_URL = "https://raspisanie.rusoil.net"
 GROUP_NAME = "БНИ-26-01"
 GROUP_ID = 157710
@@ -171,6 +173,8 @@ def publish(ics_bytes: bytes) -> str:
         "x-upsert": "true",  # перезаписать, если файл уже существует
     }
     resp = requests.post(upload_url, headers=headers, data=ics_bytes)
+    if not resp.ok:
+        print(f"Supabase Storage ответил {resp.status_code}: {resp.text}")
     resp.raise_for_status()
     return f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{FILENAME}"
 
