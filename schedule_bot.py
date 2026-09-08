@@ -23,8 +23,8 @@ from supabase import create_client
 
 # --- конфиг ---
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]  # service_role, не anon
+SUPABASE_URL = "https://pobepdbenznpdpgobwli.supabase.co"
+SUPABASE_KEY = "sb_secret_PKIqE4uheGBNf4kFu-LXUQ_cE2whdKP"  # service_role, не anon
 BUCKET = "calendar"
 FILENAME = "schedule.ics"
 
