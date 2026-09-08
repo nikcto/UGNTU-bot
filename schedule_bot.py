@@ -19,12 +19,11 @@ from hashlib import md5
 
 import requests
 from icalendar import Calendar, Event
-from supabase import create_client
 
 # --- конфиг ---
 
-SUPABASE_URL = "https://pobepdbenznpdpgobwli.supabase.co"
-SUPABASE_KEY = "sb_secret_PKIqE4uheGBNf4kFu-LXUQ_cE2whdKP"  # service_role, не anon
+SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]  # sb_secret_...
 BUCKET = "calendar"
 FILENAME = "schedule.ics"
 
@@ -47,9 +46,6 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Content-Type": "application/x-www-form-urlencoded",
 }
-
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
 
 # --- шаг 1: скрейпинг ---
 
@@ -164,15 +160,19 @@ def build_ics(lessons: list[dict]) -> bytes:
     return cal.to_ical()
 
 
-# --- шаг 3: публикация в Supabase Storage ---
+# --- шаг 3: публикация в Supabase Storage (напрямую через REST, без клиента) ---
 
 def publish(ics_bytes: bytes) -> str:
-    supabase.storage.from_(BUCKET).upload(
-        FILENAME,
-        ics_bytes,
-        {"content-type": "text/calendar; charset=utf-8", "upsert": "true"},
-    )
-    return supabase.storage.from_(BUCKET).get_public_url(FILENAME)
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{FILENAME}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "text/calendar; charset=utf-8",
+        "x-upsert": "true",  # перезаписать, если файл уже существует
+    }
+    resp = requests.post(upload_url, headers=headers, data=ics_bytes)
+    resp.raise_for_status()
+    return f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{FILENAME}"
 
 
 # --- цикл ---
