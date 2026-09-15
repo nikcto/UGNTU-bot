@@ -5,23 +5,40 @@
   1) забирает расписание с raspisanie.rusoil.net через внутренний API
      (обычные HTTP-запросы, без браузера)
   2) сравнивает с предыдущим снимком расписания (хранится в Supabase Storage)
-  3) если есть изменения — шлёт уведомление в Telegram
+  3) если есть изменения — шлёт push-уведомление в ntfy (на айфон)
 
 Каждые PUBLISH_INTERVAL_SECONDS (1 час):
   4) собирает .ics и кладёт его в публичный бакет Supabase Storage
 
+При запуске бот сразу шлёт уведомление "работаю, всё збс".
+
 Плюс слушает Telegram на команду /ping — по ней сразу же проверяет расписание
-вне очереди и отвечает в чат, есть изменения или нет.
+вне очереди; ответ ("есть изменения / нет изменений") тоже уходит через ntfy,
+а не в Telegram — Telegram здесь используется только как канал для команды,
+раз ntfy умеет только присылать уведомления, но не принимать сообщения от вас.
+Если /ping вам не нужен — блок telegram_listener можно просто не запускать
+(см. main()).
 
 Нужные переменные окружения (.env локально / переменные окружения на Railway):
-    TELEGRAM_BOT_TOKEN — токен бота, выданный BotFather
-    TELEGRAM_CHAT_ID   — id чата/пользователя, куда слать уведомления
+    TELEGRAM_BOT_TOKEN — токен бота, выданный BotFather (нужен только для /ping)
+    TELEGRAM_CHAT_ID   — id чата/пользователя, из которого разрешён /ping
+    NTFY_TOPIC         — название вашего приватного топика в ntfy (см. ниже)
+    NTFY_SERVER        — опционально, свой сервер ntfy; по умолчанию https://ntfy.sh
 
 requirements.txt для этого сервиса:
     requests
     icalendar
     supabase
     python-dotenv
+
+--- Настройка ntfy (один раз, 2 минуты) ---
+1. Поставьте приложение ntfy на iPhone (App Store, бесплатное).
+2. В приложении нажмите "+" -> Subscribe to topic -> вставьте значение
+   NTFY_TOPIC ниже (сейчас там сгенерирован случайный уникальный топик —
+   не меняйте его на что-то простое вроде "raspisanie", топики в ntfy.sh
+   публичные "по знанию имени", случайная строка защищает от того, что кто-то
+   левый угадает имя и будет читать/слать в ваш топик).
+3. Всё, дальше бот сам будет присылать уведомления в это приложение.
 """
 import json
 import os
@@ -47,6 +64,12 @@ BASE_URL = "https://raspisanie.rusoil.net"
 GROUP_NAME = "БЦШ02-26-02"
 GROUP_ID = 163685
 
+# ntfy — сюда шлём push-уведомления на телефон
+NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+NTFY_TOPIC = os.getenv("NTFY_TOPIC", "nikcto")
+
+# Telegram оставлен только как способ прислать команду /ping боту —
+# сами уведомления теперь идут не сюда, а в ntfy.
 TELEGRAM_BOT_TOKEN = "8660024020:AAFijdCAcBUKkMKGebmAhYeMtkHsTKJJTuA"
 TELEGRAM_CHAT_ID = "1132255032"
 
@@ -230,7 +253,7 @@ def save_state(lessons: list[dict]) -> None:
     resp.raise_for_status()
 
 
-# --- шаг 5: сравнение расписаний и уведомления в Telegram ---
+# --- шаг 5: сравнение расписаний и push-уведомления в ntfy ---
 
 def format_lesson(lesson: dict) -> str:
     parts = [lesson["date"], lesson["time"], f"{lesson['subject']} ({lesson['type']})"]
@@ -262,14 +285,42 @@ def compute_diff(prev: dict[str, dict], curr: dict[str, dict]) -> list[str]:
     return lines
 
 
+def send_ntfy(text: str, title: str | None = None, priority: int = 3, tags: list[str] | None = None) -> None:
+    """Шлёт push-уведомление в ntfy (на телефон). Использует JSON-публикацию,
+    чтобы кириллица в заголовке/тексте не ломалась (обычные HTTP-заголовки
+    ntfy требуют латиницы)."""
+    if not NTFY_TOPIC:
+        print("Пропускаю отправку в ntfy: не задан NTFY_TOPIC")
+        return
+
+    max_len = 3800  # запас от лимита сообщения ntfy (~4096 байт)
+    chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [text]
+
+    for i, chunk in enumerate(chunks):
+        payload = {
+            "topic": NTFY_TOPIC,
+            "message": chunk,
+            "priority": priority,
+        }
+        if title:
+            payload["title"] = title if len(chunks) == 1 else f"{title} ({i + 1}/{len(chunks)})"
+        if tags:
+            payload["tags"] = tags
+
+        resp = requests.post(NTFY_SERVER, json=payload)
+        if not resp.ok:
+            print(f"ntfy ответил {resp.status_code}: {resp.text}")
+
+
 def send_telegram_message(text: str, chat_id: str | None = None) -> None:
+    """Оставлен только для ответа на /ping в Telegram-чат, если вдруг понадобится
+    продублировать туда же; в остальном уведомления идут через send_ntfy."""
     target_chat_id = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_BOT_TOKEN or not target_chat_id:
-        print("Пропускаю отправку в Telegram: не заданы TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    max_len = 3500  # запас от лимита Telegram в 4096 символов
+    max_len = 3500
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [text]
     for chunk in chunks:
         resp = requests.post(url, data={"chat_id": target_chat_id, "text": chunk})
@@ -290,7 +341,12 @@ def check_for_changes() -> tuple[list[dict], list[str]]:
         if prev_state:  # не спамим уведомлением при первом запуске / пустом снимке
             diff_lines = compute_diff(prev_state, curr_state)
             if diff_lines:
-                send_telegram_message("📅 Изменения в расписании:\n\n" + "\n".join(diff_lines))
+                send_ntfy(
+                    "\n".join(diff_lines),
+                    title="Изменения в расписании",
+                    priority=4,
+                    tags=["calendar"],
+                )
                 print(f"Найдено изменений: {len(diff_lines)}")
 
         if curr_state != prev_state:
@@ -299,7 +355,7 @@ def check_for_changes() -> tuple[list[dict], list[str]]:
         return lessons, diff_lines
 
 
-# --- шаг 6: приём команд из Telegram (long polling) ---
+# --- шаг 6: приём команд из Telegram (long polling), только ради /ping ---
 
 def get_telegram_updates(offset: int | None) -> list[dict]:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
@@ -312,21 +368,26 @@ def get_telegram_updates(offset: int | None) -> list[dict]:
 
 
 def handle_ping(chat_id: str) -> None:
-    send_telegram_message("🔍 Проверяю расписание...", chat_id=chat_id)
+    send_ntfy("🔍 Проверяю расписание по команде /ping...", title="Проверка запущена", tags=["mag"])
     try:
         _, diff_lines = check_for_changes()
     except Exception as e:
-        send_telegram_message(f"Не смог проверить расписание: {e}", chat_id=chat_id)
+        send_ntfy(f"Не смог проверить расписание: {e}", title="Ошибка проверки", priority=4, tags=["warning"])
         return
 
     if diff_lines:
-        send_telegram_message(f"Готово, найдено изменений: {len(diff_lines)} (детали — сообщением выше).", chat_id=chat_id)
+        send_ntfy(
+            f"Готово, найдено изменений: {len(diff_lines)} (детали — уведомлением выше).",
+            title="Проверка завершена",
+            tags=["white_check_mark"],
+        )
     else:
-        send_telegram_message("Проверил — изменений нет, расписание актуально.", chat_id=chat_id)
+        send_ntfy("Проверил — изменений нет, расписание актуально.", title="Проверка завершена", tags=["white_check_mark"])
 
 
 def telegram_listener() -> None:
-    """Слушает Telegram в фоне и реагирует на /ping вне обычного 10-минутного цикла."""
+    """Слушает Telegram в фоне и реагирует на /ping вне обычного 10-минутного цикла.
+    Используется только как способ дать команду боту — сами ответы уходят в ntfy."""
     if not TELEGRAM_BOT_TOKEN:
         print("TELEGRAM_BOT_TOKEN не задан — команда /ping работать не будет")
         return
@@ -359,6 +420,12 @@ def telegram_listener() -> None:
 # --- цикл ---
 
 def main() -> None:
+    send_ntfy(
+        "Бот расписания запущен и работает — всё збс.",
+        title="Бот в строю ✅",
+        tags=["rocket"],
+    )
+
     threading.Thread(target=telegram_listener, daemon=True).start()
 
     last_publish = 0.0
@@ -375,6 +442,7 @@ def main() -> None:
                 last_publish = now
         except Exception as e:
             print(f"Ошибка: {e}")
+            send_ntfy(f"⚠️ Ошибка в основном цикле: {e}", title="Ошибка бота", priority=4, tags=["warning"])
 
         time.sleep(CHECK_INTERVAL_SECONDS)
 
