@@ -10,6 +10,9 @@
 Каждые PUBLISH_INTERVAL_SECONDS (1 час):
   4) собирает .ics и кладёт его в публичный бакет Supabase Storage
 
+Плюс слушает Telegram на команду /ping — по ней сразу же проверяет расписание
+вне очереди и отвечает в чат, есть изменения или нет.
+
 Нужные переменные окружения (.env локально / переменные окружения на Railway):
     TELEGRAM_BOT_TOKEN — токен бота, выданный BotFather
     TELEGRAM_CHAT_ID   — id чата/пользователя, куда слать уведомления
@@ -22,6 +25,7 @@ requirements.txt для этого сервиса:
 """
 import json
 import os
+import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from hashlib import md5
@@ -43,8 +47,8 @@ BASE_URL = "https://raspisanie.rusoil.net"
 GROUP_NAME = "БЦШ02-26-02"
 GROUP_ID = 163685
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = "8660024020:AAFijdCAcBUKkMKGebmAhYeMtkHsTKJJTuA"
+TELEGRAM_CHAT_ID = "1132255032"
 
 # Якорь для перевода "номер недели + день недели" в календарную дату.
 # 09.09.2026 — среда 2-й недели -> понедельник 2-й недели = 07.09.2026.
@@ -56,6 +60,8 @@ MAX_WEEK = 30
 EMPTY_WEEKS_TO_STOP = 3
 CHECK_INTERVAL_SECONDS = 10 * 60  # проверка изменений расписания — каждые 10 минут
 PUBLISH_INTERVAL_SECONDS = 60 * 60  # обновление .ics в Supabase — раз в час
+
+SCHEDULE_LOCK = threading.Lock()  # чтобы плановая проверка и /ping не пересекались
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/155.0",
@@ -199,9 +205,13 @@ def fetch_state() -> dict[str, dict]:
     url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{STATE_FILENAME}"
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     resp = requests.get(url, headers=headers)
-    if resp.status_code == 404:
+
+    # Supabase Storage отдаёт 400 ИЛИ 404 на несуществующий объект (зависит от версии) —
+    # при первом запуске файла-снимка ещё нет, это ожидаемо, не ошибка.
+    if resp.status_code in (400, 404):
         return {}
     resp.raise_for_status()
+
     lessons = resp.json()
     return {lesson["uid"]: lesson for lesson in lessons}
 
@@ -252,8 +262,9 @@ def compute_diff(prev: dict[str, dict], curr: dict[str, dict]) -> list[str]:
     return lines
 
 
-def send_telegram_message(text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+def send_telegram_message(text: str, chat_id: str | None = None) -> None:
+    target_chat_id = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_BOT_TOKEN or not target_chat_id:
         print("Пропускаю отправку в Telegram: не заданы TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
         return
 
@@ -261,41 +272,105 @@ def send_telegram_message(text: str) -> None:
     max_len = 3500  # запас от лимита Telegram в 4096 символов
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [text]
     for chunk in chunks:
-        resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk})
+        resp = requests.post(url, data={"chat_id": target_chat_id, "text": chunk})
         if not resp.ok:
             print(f"Telegram ответил {resp.status_code}: {resp.text}")
 
 
 # --- цикл ---
 
-def check_for_changes() -> list[dict]:
+def check_for_changes() -> tuple[list[dict], list[str]]:
     """Забирает текущее расписание, сравнивает с сохранённым снимком и уведомляет об изменениях."""
-    lessons = fetch_all_lessons()
-    curr_state = {lesson["uid"]: lesson for lesson in lessons}
-    prev_state = fetch_state()
+    with SCHEDULE_LOCK:
+        lessons = fetch_all_lessons()
+        curr_state = {lesson["uid"]: lesson for lesson in lessons}
+        prev_state = fetch_state()
 
-    if prev_state:  # не спамим уведомлением при первом запуске / пустом снимке
-        diff_lines = compute_diff(prev_state, curr_state)
-        if diff_lines:
-            send_telegram_message("📅 Изменения в расписании:\n\n" + "\n".join(diff_lines))
-            print(f"Найдено изменений: {len(diff_lines)}")
+        diff_lines: list[str] = []
+        if prev_state:  # не спамим уведомлением при первом запуске / пустом снимке
+            diff_lines = compute_diff(prev_state, curr_state)
+            if diff_lines:
+                send_telegram_message("📅 Изменения в расписании:\n\n" + "\n".join(diff_lines))
+                print(f"Найдено изменений: {len(diff_lines)}")
 
-    if curr_state != prev_state:
-        save_state(lessons)
+        if curr_state != prev_state:
+            save_state(lessons)
 
-    return lessons
+        return lessons, diff_lines
 
+
+# --- шаг 6: приём команд из Telegram (long polling) ---
+
+def get_telegram_updates(offset: int | None) -> list[dict]:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"timeout": 30}
+    if offset is not None:
+        params["offset"] = offset
+    resp = requests.get(url, params=params, timeout=35)
+    resp.raise_for_status()
+    return resp.json().get("result", [])
+
+
+def handle_ping(chat_id: str) -> None:
+    send_telegram_message("🔍 Проверяю расписание...", chat_id=chat_id)
+    try:
+        _, diff_lines = check_for_changes()
+    except Exception as e:
+        send_telegram_message(f"Не смог проверить расписание: {e}", chat_id=chat_id)
+        return
+
+    if diff_lines:
+        send_telegram_message(f"Готово, найдено изменений: {len(diff_lines)} (детали — сообщением выше).", chat_id=chat_id)
+    else:
+        send_telegram_message("Проверил — изменений нет, расписание актуально.", chat_id=chat_id)
+
+
+def telegram_listener() -> None:
+    """Слушает Telegram в фоне и реагирует на /ping вне обычного 10-минутного цикла."""
+    if not TELEGRAM_BOT_TOKEN:
+        print("TELEGRAM_BOT_TOKEN не задан — команда /ping работать не будет")
+        return
+
+    offset: int | None = None
+    while True:
+        try:
+            updates = get_telegram_updates(offset)
+        except Exception as e:
+            print(f"Ошибка получения апдейтов из Telegram: {e}")
+            time.sleep(5)
+            continue
+
+        for update in updates:
+            offset = update["update_id"] + 1
+            message = update.get("message") or update.get("edited_message") or {}
+            text = (message.get("text") or "").strip()
+            chat = message.get("chat") or {}
+            chat_id = str(chat.get("id", ""))
+
+            if text != "/ping" or not chat_id:
+                continue
+            if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
+                print(f"Игнорирую /ping из чужого чата {chat_id}")
+                continue
+
+            handle_ping(chat_id)
+
+
+# --- цикл ---
 
 def main() -> None:
+    threading.Thread(target=telegram_listener, daemon=True).start()
+
     last_publish = 0.0
     while True:
         try:
-            lessons = check_for_changes()
+            lessons, _ = check_for_changes()
 
             now = time.monotonic()
             if now - last_publish >= PUBLISH_INTERVAL_SECONDS:
-                ics_bytes = build_ics(lessons)
-                url = publish(ics_bytes)
+                with SCHEDULE_LOCK:
+                    ics_bytes = build_ics(lessons)
+                    url = publish(ics_bytes)
                 print(f"Опубликовано {len(lessons)} занятий -> {url}")
                 last_publish = now
         except Exception as e:
