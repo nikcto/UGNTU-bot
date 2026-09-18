@@ -39,6 +39,20 @@ requirements.txt для этого сервиса:
    публичные "по знанию имени", случайная строка защищает от того, что кто-то
    левый угадает имя и будет читать/слать в ваш топик).
 3. Всё, дальше бот сам будет присылать уведомления в это приложение.
+
+--- Что изменено в этой версии по сравнению с исходной ---
+Публичный ntfy.sh иногда рвёт соединение (SSLEOFError, RemoteDisconnected) —
+это не баг в коде, а нестабильность/лимиты самого публичного сервера. Раньше
+одна неудачная отправка в ntfy могла: (а) уронить основной цикл целиком, и
+(б) даже попытка сообщить об ошибке через тот же send_ntfy могла сама упасть
+и уронить процесс без единой записи в лог. Теперь:
+  - все HTTP-запросы получили timeout (раньше зависание могло быть бесконечным);
+  - send_ntfy() делает несколько попыток с задержкой (retry + backoff) и
+    ГАРАНТИРОВАННО не бросает исключение наружу — в худшем случае просто
+    напечатает ошибку в лог и продолжит работу;
+  - вызов send_ntfy() внутри обработчика ошибок в main() обёрнут в
+    try/except на всякий случай (защита в глубину — сам send_ntfy и так не
+    должен падать, но дважды проверить не помешает).
 """
 import json
 import os
@@ -67,6 +81,9 @@ GROUP_ID = 163685
 # ntfy — сюда шлём push-уведомления на телефон
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "nikcto")
+NTFY_TIMEOUT_SECONDS = 10
+NTFY_MAX_ATTEMPTS = 3
+NTFY_RETRY_BACKOFF_SECONDS = 3  # 3с, потом 6с, потом 9с между попытками
 
 # Telegram оставлен только как способ прислать команду /ping боту —
 # сами уведомления теперь идут не сюда, а в ntfy.
@@ -83,6 +100,7 @@ MAX_WEEK = 30
 EMPTY_WEEKS_TO_STOP = 3
 CHECK_INTERVAL_SECONDS = 10 * 60  # проверка изменений расписания — каждые 10 минут
 PUBLISH_INTERVAL_SECONDS = 60 * 60  # обновление .ics в Supabase — раз в час
+REQUEST_TIMEOUT_SECONDS = 20  # общий таймаут для запросов к сайту/Supabase
 
 SCHEDULE_LOCK = threading.Lock()  # чтобы плановая проверка и /ping не пересекались
 
@@ -108,7 +126,11 @@ def make_session() -> requests.Session:
         },
         ensure_ascii=False,
     )
-    resp = session.get(f"{BASE_URL}/", params={"page": "schedule", "search": search_param})
+    resp = session.get(
+        f"{BASE_URL}/",
+        params={"page": "schedule", "search": search_param},
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
     resp.raise_for_status()
     return session
 
@@ -119,6 +141,7 @@ def fetch_week_raw(session: requests.Session, week: int) -> list[dict]:
         f"{BASE_URL}/origins/get_rasp_student",
         data=payload.encode("utf-8"),
         headers={"Referer": f"{BASE_URL}/?page=schedule", "Origin": BASE_URL},
+        timeout=REQUEST_TIMEOUT_SECONDS,
     )
     resp.raise_for_status()
     return resp.json()
@@ -215,7 +238,7 @@ def publish(ics_bytes: bytes) -> str:
         "Content-Type": "text/calendar; charset=utf-8",
         "x-upsert": "true",  # перезаписать, если файл уже существует
     }
-    resp = requests.post(upload_url, headers=headers, data=ics_bytes)
+    resp = requests.post(upload_url, headers=headers, data=ics_bytes, timeout=REQUEST_TIMEOUT_SECONDS)
     if not resp.ok:
         print(f"Supabase Storage ответил {resp.status_code}: {resp.text}")
     resp.raise_for_status()
@@ -227,7 +250,7 @@ def publish(ics_bytes: bytes) -> str:
 def fetch_state() -> dict[str, dict]:
     url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{STATE_FILENAME}"
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    resp = requests.get(url, headers=headers)
+    resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
 
     # Supabase Storage отдаёт 400 ИЛИ 404 на несуществующий объект (зависит от версии) —
     # при первом запуске файла-снимка ещё нет, это ожидаемо, не ошибка.
@@ -247,7 +270,12 @@ def save_state(lessons: list[dict]) -> None:
         "Content-Type": "application/json",
         "x-upsert": "true",
     }
-    resp = requests.post(upload_url, headers=headers, data=json.dumps(lessons, ensure_ascii=False).encode("utf-8"))
+    resp = requests.post(
+        upload_url,
+        headers=headers,
+        data=json.dumps(lessons, ensure_ascii=False).encode("utf-8"),
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
     if not resp.ok:
         print(f"Supabase Storage (state) ответил {resp.status_code}: {resp.text}")
     resp.raise_for_status()
@@ -285,17 +313,28 @@ def compute_diff(prev: dict[str, dict], curr: dict[str, dict]) -> list[str]:
     return lines
 
 
-def send_ntfy(text: str, title: str | None = None, priority: int = 3, tags: list[str] | None = None) -> None:
+def send_ntfy(text: str, title: str | None = None, priority: int = 3, tags: list[str] | None = None) -> bool:
     """Шлёт push-уведомление в ntfy (на телефон). Использует JSON-публикацию,
     чтобы кириллица в заголовке/тексте не ломалась (обычные HTTP-заголовки
-    ntfy требуют латиницы)."""
+    ntfy требуют латиницы).
+
+    Публичный ntfy.sh время от времени рвёт соединение (SSLEOFError,
+    RemoteDisconnected и т.п.) — это ожидаемо для бесплатного общего сервера.
+    Поэтому здесь есть retry с задержкой, таймаут на каждый запрос, и —
+    самое важное — функция НИКОГДА не бросает исключение наружу. В худшем
+    случае она просто напечатает ошибку в лог и вернёт False, чтобы не
+    уронить вызывающий код (включая обработку других ошибок).
+
+    Возвращает True, если все части сообщения отправлены успешно.
+    """
     if not NTFY_TOPIC:
         print("Пропускаю отправку в ntfy: не задан NTFY_TOPIC")
-        return
+        return False
 
     max_len = 3800  # запас от лимита сообщения ntfy (~4096 байт)
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [text]
 
+    all_ok = True
     for i, chunk in enumerate(chunks):
         payload = {
             "topic": NTFY_TOPIC,
@@ -307,9 +346,27 @@ def send_ntfy(text: str, title: str | None = None, priority: int = 3, tags: list
         if tags:
             payload["tags"] = tags
 
-        resp = requests.post(NTFY_SERVER, json=payload)
-        if not resp.ok:
-            print(f"ntfy ответил {resp.status_code}: {resp.text}")
+        chunk_ok = False
+        for attempt in range(1, NTFY_MAX_ATTEMPTS + 1):
+            try:
+                resp = requests.post(NTFY_SERVER, json=payload, timeout=NTFY_TIMEOUT_SECONDS)
+                if resp.ok:
+                    chunk_ok = True
+                    break
+                print(f"ntfy ответил {resp.status_code}: {resp.text} (попытка {attempt}/{NTFY_MAX_ATTEMPTS})")
+            except requests.exceptions.RequestException as e:
+                # Сюда попадают в том числе SSLEOFError и RemoteDisconnected —
+                # это транспортные ошибки на стороне ntfy.sh, не баг в коде.
+                print(f"Не удалось достучаться до ntfy: {e} (попытка {attempt}/{NTFY_MAX_ATTEMPTS})")
+
+            if attempt < NTFY_MAX_ATTEMPTS:
+                time.sleep(NTFY_RETRY_BACKOFF_SECONDS * attempt)
+
+        if not chunk_ok:
+            print(f"Не удалось отправить уведомление в ntfy после {NTFY_MAX_ATTEMPTS} попыток, пропускаю.")
+            all_ok = False
+
+    return all_ok
 
 
 def send_telegram_message(text: str, chat_id: str | None = None) -> None:
@@ -323,15 +380,23 @@ def send_telegram_message(text: str, chat_id: str | None = None) -> None:
     max_len = 3500
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [text]
     for chunk in chunks:
-        resp = requests.post(url, data={"chat_id": target_chat_id, "text": chunk})
-        if not resp.ok:
-            print(f"Telegram ответил {resp.status_code}: {resp.text}")
+        try:
+            resp = requests.post(
+                url, data={"chat_id": target_chat_id, "text": chunk}, timeout=REQUEST_TIMEOUT_SECONDS
+            )
+            if not resp.ok:
+                print(f"Telegram ответил {resp.status_code}: {resp.text}")
+        except requests.exceptions.RequestException as e:
+            print(f"Не удалось отправить сообщение в Telegram: {e}")
 
 
 # --- цикл ---
 
 def check_for_changes() -> tuple[list[dict], list[str]]:
-    """Забирает текущее расписание, сравнивает с сохранённым снимком и уведомляет об изменениях."""
+    """Забирает текущее расписание, сравнивает с сохранённым снимком, уведомляет об
+    изменениях и, если расписание реально изменилось, сразу же публикует новый .ics
+    (не дожидаясь часового цикла публикации) — чтобы календарь на телефоне обновлялся
+    практически сразу после обнаружения изменения, а не с задержкой до часа."""
     with SCHEDULE_LOCK:
         lessons = fetch_all_lessons()
         curr_state = {lesson["uid"]: lesson for lesson in lessons}
@@ -349,10 +414,15 @@ def check_for_changes() -> tuple[list[dict], list[str]]:
                 )
                 print(f"Найдено изменений: {len(diff_lines)}")
 
-        if curr_state != prev_state:
+        changed = curr_state != prev_state
+        if changed:
             save_state(lessons)
+            # Расписание изменилось — публикуем .ics сразу, не дожидаясь часового таймера.
+            ics_bytes = build_ics(lessons)
+            url = publish(ics_bytes)
+            print(f"Расписание изменилось, .ics опубликован немедленно -> {url}")
 
-        return lessons, diff_lines
+        return lessons, diff_lines, changed
 
 
 # --- шаг 6: приём команд из Telegram (long polling), только ради /ping ---
@@ -370,7 +440,7 @@ def get_telegram_updates(offset: int | None) -> list[dict]:
 def handle_ping(chat_id: str) -> None:
     send_ntfy("🔍 Проверяю расписание по команде /ping...", title="Проверка запущена", tags=["mag"])
     try:
-        _, diff_lines = check_for_changes()
+        _, diff_lines, _ = check_for_changes()
     except Exception as e:
         send_ntfy(f"Не смог проверить расписание: {e}", title="Ошибка проверки", priority=4, tags=["warning"])
         return
@@ -431,10 +501,16 @@ def main() -> None:
     last_publish = 0.0
     while True:
         try:
-            lessons, _ = check_for_changes()
-
+            lessons, _, changed = check_for_changes()
             now = time.monotonic()
-            if now - last_publish >= PUBLISH_INTERVAL_SECONDS:
+
+            if changed:
+                # check_for_changes() уже опубликовал .ics немедленно — просто
+                # сбрасываем часовой таймер, чтобы не публиковать то же самое дважды подряд.
+                last_publish = now
+            elif now - last_publish >= PUBLISH_INTERVAL_SECONDS:
+                # Изменений не было, но раз в час всё равно republish-имся на всякий
+                # случай (защита от рассинхрона, если что-то пошло не так раньше).
                 with SCHEDULE_LOCK:
                     ics_bytes = build_ics(lessons)
                     url = publish(ics_bytes)
@@ -442,7 +518,13 @@ def main() -> None:
                 last_publish = now
         except Exception as e:
             print(f"Ошибка: {e}")
-            send_ntfy(f"⚠️ Ошибка в основном цикле: {e}", title="Ошибка бота", priority=4, tags=["warning"])
+            # send_ntfy сам по себе не должен бросать исключений (см. его код выше),
+            # но try/except здесь — дополнительная страховка, чтобы даже
+            # непредвиденная ошибка внутри уведомления не уронила основной цикл.
+            try:
+                send_ntfy(f"⚠️ Ошибка в основном цикле: {e}", title="Ошибка бота", priority=4, tags=["warning"])
+            except Exception as notify_error:
+                print(f"Не удалось даже уведомить об ошибке: {notify_error}")
 
         time.sleep(CHECK_INTERVAL_SECONDS)
 
