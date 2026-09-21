@@ -81,7 +81,7 @@ LESSON_TZ = ZoneInfo("Asia/Yekaterinburg")
 #              а не падают в публичный топик по ошибке.
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "nikcto")
-NTFY_ADMIN_TOPIC = os.getenv("NTFY_ADMIN_TOPIC", "")
+NTFY_ADMIN_TOPIC = os.getenv("NTFY_ADMIN_TOPIC", "surrad")
 NTFY_TIMEOUT_SECONDS = 10
 NTFY_MAX_ATTEMPTS = 3
 NTFY_RETRY_BACKOFF_SECONDS = 3  # 3с, потом 6с, потом 9с между попытками
