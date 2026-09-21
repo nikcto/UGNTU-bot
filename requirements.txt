@@ -1,2 +1,4 @@
 requests==2.32.3
 icalendar==6.1.0
+python-dotenv==1.0.1
+tzdata==2026.4
