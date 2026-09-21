@@ -22,7 +22,10 @@
 Нужные переменные окружения (.env локально / переменные окружения на Railway):
     TELEGRAM_BOT_TOKEN — токен бота, выданный BotFather (нужен только для /ping)
     TELEGRAM_CHAT_ID   — id чата/пользователя, из которого разрешён /ping
-    NTFY_TOPIC         — название вашего приватного топика в ntfy (см. ниже)
+    NTFY_TOPIC         — публичный топик: изменения расписания, на него подписаны все
+    NTFY_ADMIN_TOPIC   — приватный топик только для тебя: старт бота, ошибки, /ping.
+                         Если не задать — эти сообщения просто не отправляются никуда
+                         (тихо оседают в логах), в публичный топик они НЕ упадут.
     NTFY_SERVER        — опционально, свой сервер ntfy; по умолчанию https://ntfy.sh
 
 requirements.txt для этого сервиса:
@@ -69,9 +72,16 @@ GROUP_ID = 163685
 # Часовой пояс, в котором на самом деле проходят пары (Уфа = Екатеринбургское время, UTC+5).
 LESSON_TZ = ZoneInfo("Asia/Yekaterinburg")
 
-# ntfy — сюда шлём push-уведомления на телефон
+# ntfy — сюда шлём push-уведомления на телефон.
+# NTFY_TOPIC — публичный топик, на него подписаны все, кто пользуется календарём:
+#              сюда идут только уведомления об изменениях в расписании.
+# NTFY_ADMIN_TOPIC — отдельный приватный топик только для тебя: сюда идут
+#              техническое: старт бота, ошибки, ответы на /ping. Если не задать —
+#              эти уведомления просто не отправляются никуда (тихо оседают в логах),
+#              а не падают в публичный топик по ошибке.
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
-NTFY_TOPIC = os.getenv("NTFY_TOPIC", "surr")
+NTFY_TOPIC = os.getenv("NTFY_TOPIC", "nikcto")
+NTFY_ADMIN_TOPIC = os.getenv("NTFY_ADMIN_TOPIC", "")
 NTFY_TIMEOUT_SECONDS = 10
 NTFY_MAX_ATTEMPTS = 3
 NTFY_RETRY_BACKOFF_SECONDS = 3  # 3с, потом 6с, потом 9с между попытками
@@ -309,10 +319,15 @@ def compute_diff(prev: dict[str, dict], curr: dict[str, dict]) -> list[str]:
     return lines
 
 
-def send_ntfy(text: str, title: str | None = None, priority: int = 3, tags: list[str] | None = None) -> bool:
+def send_ntfy(text: str, title: str | None = None, priority: int = 3, tags: list[str] | None = None, topic: str | None = None) -> bool:
     """Шлёт push-уведомление в ntfy (на телефон). Использует JSON-публикацию,
     чтобы кириллица в заголовке/тексте не ломалась (обычные HTTP-заголовки
     ntfy требуют латиницы).
+
+    topic — в какой топик слать; по умолчанию публичный NTFY_TOPIC (расписание,
+    его видят все). Для служебных/админских сообщений передавайте
+    topic=NTFY_ADMIN_TOPIC явно — здесь нет автоматического фолбэка на
+    публичный топик, чтобы техническое случайно не улетело всем подписчикам.
 
     Публичный ntfy.sh время от времени рвёт соединение (SSLEOFError,
     RemoteDisconnected и т.п.) — это ожидаемо для бесплатного общего сервера.
@@ -323,8 +338,9 @@ def send_ntfy(text: str, title: str | None = None, priority: int = 3, tags: list
 
     Возвращает True, если все части сообщения отправлены успешно.
     """
-    if not NTFY_TOPIC:
-        print("Пропускаю отправку в ntfy: не задан NTFY_TOPIC")
+    target_topic = topic if topic is not None else NTFY_TOPIC
+    if not target_topic:
+        print(f"Пропускаю отправку в ntfy (топик не задан): {title or ''} {text}".strip())
         return False
 
     max_len = 3800  # запас от лимита сообщения ntfy (~4096 байт)
@@ -333,7 +349,7 @@ def send_ntfy(text: str, title: str | None = None, priority: int = 3, tags: list
     all_ok = True
     for i, chunk in enumerate(chunks):
         payload = {
-            "topic": NTFY_TOPIC,
+            "topic": target_topic,
             "message": chunk,
             "priority": priority,
         }
@@ -434,11 +450,12 @@ def get_telegram_updates(offset: int | None) -> list[dict]:
 
 
 def handle_ping(chat_id: str) -> None:
-    send_ntfy("🔍 Проверяю расписание по команде /ping...", title="Проверка запущена", tags=["mag"])
+    send_ntfy("🔍 Проверяю расписание по команде /ping...", title="Проверка запущена", tags=["mag"], topic=NTFY_ADMIN_TOPIC)
     try:
         _, diff_lines, _ = check_for_changes()
     except Exception as e:
-        send_ntfy(f"Не смог проверить расписание: {e}", title="Ошибка проверки", priority=4, tags=["warning"])
+        print(f"Ошибка проверки по /ping: {e}")
+        send_ntfy("Не смог проверить расписание — подробности в логах бота.", title="Ошибка проверки", priority=4, tags=["warning"], topic=NTFY_ADMIN_TOPIC)
         return
 
     if diff_lines:
@@ -446,9 +463,10 @@ def handle_ping(chat_id: str) -> None:
             f"Готово, найдено изменений: {len(diff_lines)} (детали — уведомлением выше).",
             title="Проверка завершена",
             tags=["white_check_mark"],
+            topic=NTFY_ADMIN_TOPIC,
         )
     else:
-        send_ntfy("Проверил — изменений нет, расписание актуально.", title="Проверка завершена", tags=["white_check_mark"])
+        send_ntfy("Проверил — изменений нет, расписание актуально.", title="Проверка завершена", tags=["white_check_mark"], topic=NTFY_ADMIN_TOPIC)
 
 
 def telegram_listener() -> None:
@@ -490,6 +508,7 @@ def main() -> None:
         "Бот расписания запущен и работает — всё збс.",
         title="Бот в строю ✅",
         tags=["rocket"],
+        topic=NTFY_ADMIN_TOPIC,
     )
 
     threading.Thread(target=telegram_listener, daemon=True).start()
@@ -513,12 +532,13 @@ def main() -> None:
                 print(f"Опубликовано {len(lessons)} занятий -> {url}")
                 last_publish = now
         except Exception as e:
-            print(f"Ошибка: {e}")
-            # send_ntfy сам по себе не должен бросать исключений (см. его код выше),
-            # но try/except здесь — дополнительная страховка, чтобы даже
-            # непредвиденная ошибка внутри уведомления не уронила основной цикл.
+            # Ошибки в основном цикле идут только тебе в админский топик, а не в
+            # публичный — остальные подписчики никогда их не увидят. Если
+            # NTFY_ADMIN_TOPIC не задан, send_ntfy сама тихо пропустит отправку
+            # и просто напечатает сообщение в лог.
+            print(f"Ошибка в основном цикле: {e}")
             try:
-                send_ntfy(f"⚠️ Ошибка в основном цикле: {e}", title="Ошибка бота", priority=4, tags=["warning"])
+                send_ntfy(f"⚠️ {e}", title="Ошибка бота", priority=4, tags=["warning"], topic=NTFY_ADMIN_TOPIC)
             except Exception as notify_error:
                 print(f"Не удалось даже уведомить об ошибке: {notify_error}")
 
