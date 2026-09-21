@@ -71,7 +71,7 @@ LESSON_TZ = ZoneInfo("Asia/Yekaterinburg")
 
 # ntfy — сюда шлём push-уведомления на телефон
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
-NTFY_TOPIC = os.getenv("NTFY_TOPIC", "nikcto")
+NTFY_TOPIC = os.getenv("NTFY_TOPIC", "surr")
 NTFY_TIMEOUT_SECONDS = 10
 NTFY_MAX_ATTEMPTS = 3
 NTFY_RETRY_BACKOFF_SECONDS = 3  # 3с, потом 6с, потом 9с между попытками
