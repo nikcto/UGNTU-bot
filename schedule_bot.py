@@ -10,20 +10,11 @@
 Каждые PUBLISH_INTERVAL_SECONDS (1 час):
   4) собирает .ics и кладёт его в публичный бакет Supabase Storage
 
-При запуске бот сразу шлёт уведомление "работаю, всё збс".
-
-Плюс слушает Telegram на команду /ping — по ней сразу же проверяет расписание
-вне очереди; ответ ("есть изменения / нет изменений") тоже уходит через ntfy,
-а не в Telegram — Telegram здесь используется только как канал для команды,
-раз ntfy умеет только присылать уведомления, но не принимать сообщения от вас.
-Если /ping вам не нужен — блок telegram_listener можно просто не запускать
-(см. main()).
+При запуске бот сразу шлёт уведомление "работаю, всё збс" (в NTFY_ADMIN_TOPIC).
 
 Нужные переменные окружения (.env локально / переменные окружения на Railway):
-    TELEGRAM_BOT_TOKEN — токен бота, выданный BotFather (нужен только для /ping)
-    TELEGRAM_CHAT_ID   — id чата/пользователя, из которого разрешён /ping
     NTFY_TOPIC         — публичный топик: изменения расписания, на него подписаны все
-    NTFY_ADMIN_TOPIC   — приватный топик только для тебя: старт бота, ошибки, /ping.
+    NTFY_ADMIN_TOPIC   — приватный топик только для тебя: старт бота, ошибки.
                          Если не задать — эти сообщения просто не отправляются никуда
                          (тихо оседают в логах), в публичный топик они НЕ упадут.
     NTFY_SERVER        — опционально, свой сервер ntfy; по умолчанию https://ntfy.sh
@@ -382,8 +373,8 @@ def send_ntfy(text: str, title: str | None = None, priority: int = 3, tags: list
 
 
 def send_telegram_message(text: str, chat_id: str | None = None) -> None:
-    """Оставлен только для ответа на /ping в Telegram-чат, если вдруг понадобится
-    продублировать туда же; в остальном уведомления идут через send_ntfy."""
+    """Не используется сейчас (Telegram-часть отключена, см. main()) — оставлена
+    в коде на случай, если позже снова понадобится дублировать что-то в Telegram."""
     target_chat_id = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_BOT_TOKEN or not target_chat_id:
         return
@@ -437,71 +428,7 @@ def check_for_changes() -> tuple[list[dict], list[str]]:
         return lessons, diff_lines, changed
 
 
-# --- шаг 6: приём команд из Telegram (long polling), только ради /ping ---
-
-def get_telegram_updates(offset: int | None) -> list[dict]:
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"timeout": 30}
-    if offset is not None:
-        params["offset"] = offset
-    resp = requests.get(url, params=params, timeout=35)
-    resp.raise_for_status()
-    return resp.json().get("result", [])
-
-
-def handle_ping(chat_id: str) -> None:
-    send_ntfy("🔍 Проверяю расписание по команде /ping...", title="Проверка запущена", tags=["mag"], topic=NTFY_ADMIN_TOPIC)
-    try:
-        _, diff_lines, _ = check_for_changes()
-    except Exception as e:
-        print(f"Ошибка проверки по /ping: {e}")
-        send_ntfy("Не смог проверить расписание — подробности в логах бота.", title="Ошибка проверки", priority=4, tags=["warning"], topic=NTFY_ADMIN_TOPIC)
-        return
-
-    if diff_lines:
-        send_ntfy(
-            f"Готово, найдено изменений: {len(diff_lines)} (детали — уведомлением выше).",
-            title="Проверка завершена",
-            tags=["white_check_mark"],
-            topic=NTFY_ADMIN_TOPIC,
-        )
-    else:
-        send_ntfy("Проверил — изменений нет, расписание актуально.", title="Проверка завершена", tags=["white_check_mark"], topic=NTFY_ADMIN_TOPIC)
-
-
-def telegram_listener() -> None:
-    """Слушает Telegram в фоне и реагирует на /ping вне обычного 10-минутного цикла.
-    Используется только как способ дать команду боту — сами ответы уходят в ntfy."""
-    if not TELEGRAM_BOT_TOKEN:
-        print("TELEGRAM_BOT_TOKEN не задан — команда /ping работать не будет")
-        return
-
-    offset: int | None = None
-    while True:
-        try:
-            updates = get_telegram_updates(offset)
-        except Exception as e:
-            print(f"Ошибка получения апдейтов из Telegram: {e}")
-            time.sleep(5)
-            continue
-
-        for update in updates:
-            offset = update["update_id"] + 1
-            message = update.get("message") or update.get("edited_message") or {}
-            text = (message.get("text") or "").strip()
-            chat = message.get("chat") or {}
-            chat_id = str(chat.get("id", ""))
-
-            if text != "/ping" or not chat_id:
-                continue
-            if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
-                print(f"Игнорирую /ping из чужого чата {chat_id}")
-                continue
-
-            handle_ping(chat_id)
-
-
-# --- цикл ---
+# --- шаг 6: цикл ---
 
 def main() -> None:
     send_ntfy(
@@ -511,7 +438,10 @@ def main() -> None:
         topic=NTFY_ADMIN_TOPIC,
     )
 
-    threading.Thread(target=telegram_listener, daemon=True).start()
+    # Telegram-слушатель (/ping) отключён — хватает автоматической проверки
+    # каждые CHECK_INTERVAL_SECONDS ниже. Если понадобится вернуть — функции
+    # telegram_listener/get_telegram_updates/handle_ping были в предыдущей версии.
+
 
     last_publish = 0.0
     while True:
