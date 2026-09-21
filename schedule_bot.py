@@ -30,29 +30,16 @@ requirements.txt для этого сервиса:
     icalendar
     supabase
     python-dotenv
+    tzdata
 
---- Настройка ntfy (один раз, 2 минуты) ---
-1. Поставьте приложение ntfy на iPhone (App Store, бесплатное).
-2. В приложении нажмите "+" -> Subscribe to topic -> вставьте значение
-   NTFY_TOPIC ниже (сейчас там сгенерирован случайный уникальный топик —
-   не меняйте его на что-то простое вроде "raspisanie", топики в ntfy.sh
-   публичные "по знанию имени", случайная строка защищает от того, что кто-то
-   левый угадает имя и будет читать/слать в ваш топик).
-3. Всё, дальше бот сам будет присылать уведомления в это приложение.
-
---- Что изменено в этой версии по сравнению с исходной ---
-Публичный ntfy.sh иногда рвёт соединение (SSLEOFError, RemoteDisconnected) —
-это не баг в коде, а нестабильность/лимиты самого публичного сервера. Раньше
-одна неудачная отправка в ntfy могла: (а) уронить основной цикл целиком, и
-(б) даже попытка сообщить об ошибке через тот же send_ntfy могла сама упасть
-и уронить процесс без единой записи в лог. Теперь:
-  - все HTTP-запросы получили timeout (раньше зависание могло быть бесконечным);
-  - send_ntfy() делает несколько попыток с задержкой (retry + backoff) и
-    ГАРАНТИРОВАННО не бросает исключение наружу — в худшем случае просто
-    напечатает ошибку в лог и продолжит работу;
-  - вызов send_ntfy() внутри обработчика ошибок в main() обёрнут в
-    try/except на всякий случай (защита в глубину — сам send_ntfy и так не
-    должен падать, но дважды проверить не помешает).
+--- Часовой пояс (важно для тех, кто открывает .ics не из Уфы) ---
+Раньше время в .ics писалось "голым" (без часового пояса) — каждый календарь
+на телефоне трактовал его в СВОЁМ локальном поясе. У вас в Уфе это случайно
+совпадало, а у человека в другом поясе пары уезжали на разницу поясов.
+Теперь к каждому времени явно привязан пояс LESSON_TZ (Asia/Yekaterinburg —
+это и есть уфимское время, UTC+5; отдельной зоны "Europe/Ufa" в актуальной
+базе IANA больше нет, она давно объединена с екатеринбургской). Требует
+пакет tzdata в requirements.txt — на Windows без него зоны не резолвятся.
 """
 import json
 import os
@@ -60,6 +47,7 @@ import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from hashlib import md5
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -77,6 +65,9 @@ STATE_FILENAME = "schedule_state.json"  # снимок расписания дл
 BASE_URL = "https://raspisanie.rusoil.net"
 GROUP_NAME = "БЦШ02-26-02"
 GROUP_ID = 163685
+
+# Часовой пояс, в котором на самом деле проходят пары (Уфа = Екатеринбургское время, UTC+5).
+LESSON_TZ = ZoneInfo("Asia/Yekaterinburg")
 
 # ntfy — сюда шлём push-уведомления на телефон
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
@@ -197,14 +188,19 @@ def fetch_all_lessons() -> list[dict]:
 # --- шаг 2: сборка .ics ---
 
 def parse_dt(date_str: str, time_str: str) -> datetime:
-    return datetime.strptime(f"{date_str} {time_str}", "%d.%m.%Y %H:%M")
+    """Возвращает datetime с явно проставленным часовым поясом Уфы (UTC+5).
+    Раньше здесь возвращался "голый" datetime без tzinfo — из-за этого каждый
+    календарь трактовал время как СВОЁ локальное, и у людей в других поясах
+    пары показывались не в то время."""
+    naive = datetime.strptime(f"{date_str} {time_str}", "%d.%m.%Y %H:%M")
+    return naive.replace(tzinfo=LESSON_TZ)
 
 
 def build_ics(lessons: list[dict]) -> bytes:
     cal = Calendar()
-    cal.add("prodid", "-//BNI-26-01 Schedule//rusoil.net parser//RU")
+    cal.add("prodid", "-//BCSH02-26-02 Schedule//rusoil.net parser//RU")
     cal.add("version", "2.0")
-    cal.add("X-WR-CALNAME", "Расписание БНИ-26-01")
+    cal.add("X-WR-CALNAME", "Расписание БЦШ02-26-02")
     cal.add("X-PUBLISHED-TTL", "PT6H")
 
     for lesson in lessons:
