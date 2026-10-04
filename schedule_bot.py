@@ -8,7 +8,9 @@
   3) если есть изменения — шлёт push-уведомление в ntfy (на айфон)
 
 Каждые PUBLISH_INTERVAL_SECONDS (1 час):
-  4) собирает .ics и кладёт его в публичный бакет Supabase Storage
+  4) собирает .ics и кладёт в публичный бакет Supabase Storage — сразу
+     ЧЕТЫРЕ отдельных файла: общий + по одному на лекции/практики/лабы.
+     Разные файлы = разные подписки в календаре = разные цвета на айфоне.
 
 При запуске бот сразу шлёт уведомление "работаю, всё збс" (в NTFY_ADMIN_TOPIC).
 
@@ -22,18 +24,32 @@
 requirements.txt для этого сервиса:
     requests
     icalendar
-    supabase
     python-dotenv
     tzdata
 
 --- Часовой пояс (важно для тех, кто открывает .ics не из Уфы) ---
-Раньше время в .ics писалось "голым" (без часового пояса) — каждый календарь
-на телефоне трактовал его в СВОЁМ локальном поясе. У вас в Уфе это случайно
-совпадало, а у человека в другом поясе пары уезжали на разницу поясов.
-Теперь к каждому времени явно привязан пояс LESSON_TZ (Asia/Yekaterinburg —
-это и есть уфимское время, UTC+5; отдельной зоны "Europe/Ufa" в актуальной
-базе IANA больше нет, она давно объединена с екатеринбургской). Требует
-пакет tzdata в requirements.txt — на Windows без него зоны не резолвятся.
+К каждому времени явно привязан пояс LESSON_TZ (Asia/Yekaterinburg — это и
+есть уфимское время, UTC+5; отдельной зоны "Europe/Ufa" в актуальной базе
+IANA больше нет, она давно объединена с екатеринбургской). Требует пакет
+tzdata в requirements.txt — на Windows без него зоны не резолвятся.
+
+--- Отдельные календари по типу занятия ---
+Раньше публиковался один файл schedule.ics со всем расписанием. Теперь
+дополнительно публикуются ещё три файла — только с лекциями / только с
+практиками / только с лабами (см. CALENDARS ниже). Смысл: подписной
+календарь в приложении "Календарь" на iPhone красится ЦЕЛИКОМ одним цветом
+— разным цветом можно покрасить только РАЗНЫЕ подписки. Разбив расписание
+на 4 файла и подписавшись на каждый отдельно, можно каждому назначить свой
+цвет (например, лекции — синим, практики — зелёным, лабы — оранжевым).
+Общий файл (schedule.ics) можно держать как резервный/для тех, кому не
+важны цвета — он никуда не делся, просто перестал быть единственным.
+
+Тип занятия (поле NVIDZANAT с сайта) распознаётся по подстроке в названии
+(регистронезависимо): "лекц" -> лекции, "практ" -> практики, "лаб" -> лабы.
+Если сайт вдруг начнёт присылать тип, не попадающий ни под одну из этих
+подстрок (например "консультация", "экзамен") — такое занятие попадёт
+только в общий файл, в тематические не попадёт. Если понадобится завести
+под это отдельный календарь — добавьте ещё один элемент в CALENDARS ниже.
 """
 import json
 import os
@@ -54,11 +70,48 @@ load_dotenv()  # локально подхватит .env; на Railway файл
 SUPABASE_URL = "https://pobepdbenznpdpgobwli.supabase.co".rstrip("/")
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBvYmVwZGJlbnpucGRwZ29id2xpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4ODg4ODk3MywiZXhwIjoyMTA0NDY0OTczfQ.pFrVaNnhvN0F7mcfrJ1iQEVwVkoizDmwwhBVt0t-5gg"
 BUCKET = "calendar"
-FILENAME = "schedule.ics"
 STATE_FILENAME = "schedule_state.json"  # снимок расписания для отслеживания изменений
 BASE_URL = "https://raspisanie.rusoil.net"
 GROUP_NAME = "БЦШ02-26-02"
 GROUP_ID = 163685
+
+# Какие файлы публикуем и как отбираем в каждый занятия.
+# key -> (имя файла в Storage, название календаря для X-WR-CALNAME, функция-фильтр по типу занятия)
+# filter_fn=None означает "все занятия без разбора" (общий файл).
+def _is_lecture(t: str) -> bool:
+    return "лекц" in t.lower()
+
+
+def _is_practice(t: str) -> bool:
+    return "практ" in t.lower()
+
+
+def _is_lab(t: str) -> bool:
+    return "лаб" in t.lower()
+
+
+CALENDARS = {
+    "all": {
+        "filename": "schedule.ics",
+        "calname": "Расписание БЦШ02-26-02",
+        "filter": None,
+    },
+    "lectures": {
+        "filename": "schedule_lectures.ics",
+        "calname": "Расписание БЦШ02-26-02 — Лекции",
+        "filter": _is_lecture,
+    },
+    "practice": {
+        "filename": "schedule_practice.ics",
+        "calname": "Расписание БЦШ02-26-02 — Практики",
+        "filter": _is_practice,
+    },
+    "lab": {
+        "filename": "schedule_lab.ics",
+        "calname": "Расписание БЦШ02-26-02 — Лабораторные",
+        "filter": _is_lab,
+    },
+}
 
 # Часовой пояс, в котором на самом деле проходят пары (Уфа = Екатеринбургское время, UTC+5).
 LESSON_TZ = ZoneInfo("Asia/Yekaterinburg")
@@ -67,7 +120,7 @@ LESSON_TZ = ZoneInfo("Asia/Yekaterinburg")
 # NTFY_TOPIC — публичный топик, на него подписаны все, кто пользуется календарём:
 #              сюда идут только уведомления об изменениях в расписании.
 # NTFY_ADMIN_TOPIC — отдельный приватный топик только для тебя: сюда идут
-#              техническое: старт бота, ошибки, ответы на /ping. Если не задать —
+#              техническое: старт бота, ошибки. Если не задать —
 #              эти уведомления просто не отправляются никуда (тихо оседают в логах),
 #              а не падают в публичный топик по ошибке.
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
@@ -76,11 +129,6 @@ NTFY_ADMIN_TOPIC = os.getenv("NTFY_ADMIN_TOPIC", "surrad")
 NTFY_TIMEOUT_SECONDS = 10
 NTFY_MAX_ATTEMPTS = 3
 NTFY_RETRY_BACKOFF_SECONDS = 3  # 3с, потом 6с, потом 9с между попытками
-
-# Telegram оставлен только как способ прислать команду /ping боту —
-# сами уведомления теперь идут не сюда, а в ntfy.
-TELEGRAM_BOT_TOKEN = "8660024020:AAFijdCAcBUKkMKGebmAhYeMtkHsTKJJTuA"
-TELEGRAM_CHAT_ID = "1132255032"
 
 # Якорь для перевода "номер недели + день недели" в календарную дату.
 # 09.09.2026 — среда 2-й недели -> понедельник 2-й недели = 07.09.2026.
@@ -94,7 +142,7 @@ CHECK_INTERVAL_SECONDS = 10 * 60  # проверка изменений расп
 PUBLISH_INTERVAL_SECONDS = 60 * 60  # обновление .ics в Supabase — раз в час
 REQUEST_TIMEOUT_SECONDS = 20  # общий таймаут для запросов к сайту/Supabase
 
-SCHEDULE_LOCK = threading.Lock()  # чтобы плановая проверка и /ping не пересекались
+SCHEDULE_LOCK = threading.Lock()  # чтобы плановая проверка и ручной запуск не пересекались
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/155.0",
@@ -191,17 +239,17 @@ def fetch_all_lessons() -> list[dict]:
 def parse_dt(date_str: str, time_str: str) -> datetime:
     """Возвращает datetime с явно проставленным часовым поясом Уфы (UTC+5).
     Раньше здесь возвращался "голый" datetime без tzinfo — из-за этого каждый
-    календарь трактовал время как СВОЁ локальное, и у людей в других поясах
+    календарь трактовал время как СВОЁ локальное, и у людей в другом поясе
     пары показывались не в то время."""
     naive = datetime.strptime(f"{date_str} {time_str}", "%d.%m.%Y %H:%M")
     return naive.replace(tzinfo=LESSON_TZ)
 
 
-def build_ics(lessons: list[dict]) -> bytes:
+def build_ics(lessons: list[dict], calname: str) -> bytes:
     cal = Calendar()
     cal.add("prodid", "-//BCSH02-26-02 Schedule//rusoil.net parser//RU")
     cal.add("version", "2.0")
-    cal.add("X-WR-CALNAME", "Расписание БЦШ02-26-02")
+    cal.add("X-WR-CALNAME", calname)
     cal.add("X-PUBLISHED-TTL", "PT6H")
 
     for lesson in lessons:
@@ -227,19 +275,31 @@ def build_ics(lessons: list[dict]) -> bytes:
 
 # --- шаг 3: публикация в Supabase Storage (напрямую через REST, без клиента) ---
 
-def publish(ics_bytes: bytes) -> str:
-    upload_url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{FILENAME}"
+def publish_file(filename: str, data: bytes, content_type: str) -> str:
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{filename}"
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "text/calendar; charset=utf-8",
+        "Content-Type": content_type,
         "x-upsert": "true",  # перезаписать, если файл уже существует
     }
-    resp = requests.post(upload_url, headers=headers, data=ics_bytes, timeout=REQUEST_TIMEOUT_SECONDS)
+    resp = requests.post(upload_url, headers=headers, data=data, timeout=REQUEST_TIMEOUT_SECONDS)
     if not resp.ok:
-        print(f"Supabase Storage ответил {resp.status_code}: {resp.text}")
+        print(f"Supabase Storage ответил {resp.status_code} для {filename}: {resp.text}")
     resp.raise_for_status()
-    return f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{FILENAME}"
+    return f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{filename}"
+
+
+def publish_all_calendars(lessons: list[dict]) -> dict[str, str]:
+    """Собирает и публикует все файлы из CALENDARS (общий + по типам занятий).
+    Возвращает {ключ_календаря: публичная_ссылка}."""
+    urls: dict[str, str] = {}
+    for key, cfg in CALENDARS.items():
+        filter_fn = cfg["filter"]
+        subset = lessons if filter_fn is None else [l for l in lessons if filter_fn(l["type"])]
+        ics_bytes = build_ics(subset, cfg["calname"])
+        urls[key] = publish_file(cfg["filename"], ics_bytes, "text/calendar; charset=utf-8")
+    return urls
 
 
 # --- шаг 4: снимок расписания в Supabase Storage (для отслеживания изменений) ---
@@ -372,33 +432,12 @@ def send_ntfy(text: str, title: str | None = None, priority: int = 3, tags: list
     return all_ok
 
 
-def send_telegram_message(text: str, chat_id: str | None = None) -> None:
-    """Не используется сейчас (Telegram-часть отключена, см. main()) — оставлена
-    в коде на случай, если позже снова понадобится дублировать что-то в Telegram."""
-    target_chat_id = chat_id or TELEGRAM_CHAT_ID
-    if not TELEGRAM_BOT_TOKEN or not target_chat_id:
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    max_len = 3500
-    chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [text]
-    for chunk in chunks:
-        try:
-            resp = requests.post(
-                url, data={"chat_id": target_chat_id, "text": chunk}, timeout=REQUEST_TIMEOUT_SECONDS
-            )
-            if not resp.ok:
-                print(f"Telegram ответил {resp.status_code}: {resp.text}")
-        except requests.exceptions.RequestException as e:
-            print(f"Не удалось отправить сообщение в Telegram: {e}")
-
-
 # --- цикл ---
 
-def check_for_changes() -> tuple[list[dict], list[str]]:
+def check_for_changes() -> tuple[list[dict], list[str], bool]:
     """Забирает текущее расписание, сравнивает с сохранённым снимком, уведомляет об
-    изменениях и, если расписание реально изменилось, сразу же публикует новый .ics
-    (не дожидаясь часового цикла публикации) — чтобы календарь на телефоне обновлялся
+    изменениях и, если расписание реально изменилось, сразу же публикует все .ics
+    (не дожидаясь часового цикла публикации) — чтобы календари на телефоне обновлялись
     практически сразу после обнаружения изменения, а не с задержкой до часа."""
     with SCHEDULE_LOCK:
         lessons = fetch_all_lessons()
@@ -420,10 +459,11 @@ def check_for_changes() -> tuple[list[dict], list[str]]:
         changed = curr_state != prev_state
         if changed:
             save_state(lessons)
-            # Расписание изменилось — публикуем .ics сразу, не дожидаясь часового таймера.
-            ics_bytes = build_ics(lessons)
-            url = publish(ics_bytes)
-            print(f"Расписание изменилось, .ics опубликован немедленно -> {url}")
+            # Расписание изменилось — публикуем все .ics сразу, не дожидаясь часового таймера.
+            urls = publish_all_calendars(lessons)
+            print("Расписание изменилось, .ics опубликованы немедленно:")
+            for key, url in urls.items():
+                print(f"  {key}: {url}")
 
         return lessons, diff_lines, changed
 
@@ -438,11 +478,6 @@ def main() -> None:
         topic=NTFY_ADMIN_TOPIC,
     )
 
-    # Telegram-слушатель (/ping) отключён — хватает автоматической проверки
-    # каждые CHECK_INTERVAL_SECONDS ниже. Если понадобится вернуть — функции
-    # telegram_listener/get_telegram_updates/handle_ping были в предыдущей версии.
-
-
     last_publish = 0.0
     while True:
         try:
@@ -450,16 +485,17 @@ def main() -> None:
             now = time.monotonic()
 
             if changed:
-                # check_for_changes() уже опубликовал .ics немедленно — просто
+                # check_for_changes() уже опубликовал все .ics немедленно — просто
                 # сбрасываем часовой таймер, чтобы не публиковать то же самое дважды подряд.
                 last_publish = now
             elif now - last_publish >= PUBLISH_INTERVAL_SECONDS:
                 # Изменений не было, но раз в час всё равно republish-имся на всякий
                 # случай (защита от рассинхрона, если что-то пошло не так раньше).
                 with SCHEDULE_LOCK:
-                    ics_bytes = build_ics(lessons)
-                    url = publish(ics_bytes)
-                print(f"Опубликовано {len(lessons)} занятий -> {url}")
+                    urls = publish_all_calendars(lessons)
+                print(f"Опубликовано {len(lessons)} занятий:")
+                for key, url in urls.items():
+                    print(f"  {key}: {url}")
                 last_publish = now
         except Exception as e:
             # Ошибки в основном цикле идут только тебе в админский топик, а не в
