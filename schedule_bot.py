@@ -14,12 +14,22 @@
 
 При запуске бот сразу шлёт уведомление "работаю, всё збс" (в NTFY_ADMIN_TOPIC).
 
-Нужные переменные окружения (.env локально / переменные окружения на Railway):
+Нужные переменные окружения (задаются на хостинге — bothost/Railway — в
+разделе Variables/Переменные окружения; локально можно положить в .env):
+    SUPABASE_URL       — обязательно. Адрес проекта, вида https://xxx.supabase.co
+    SUPABASE_SERVICE_KEY — обязательно. service_role JWT-ключ (не sb_secret_...,
+                         см. Project Settings -> JWT Keys -> Legacy JWT Secret ->
+                         "Go to API keys", там service_role в виде eyJ...).
+    GROUP_NAME         — обязательно. Название группы как на сайте, например БЦШ02-26-02
+    GROUP_ID           — обязательно. id группы (число из search-параметра сайта)
     NTFY_TOPIC         — публичный топик: изменения расписания, на него подписаны все
     NTFY_ADMIN_TOPIC   — приватный топик только для тебя: старт бота, ошибки.
                          Если не задать — эти сообщения просто не отправляются никуда
                          (тихо оседают в логах), в публичный топик они НЕ упадут.
     NTFY_SERVER        — опционально, свой сервер ntfy; по умолчанию https://ntfy.sh
+    BUCKET             — опционально, имя бакета в Supabase Storage; по умолчанию calendar
+    ANCHOR_WEEK, ANCHOR_MONDAY — опционально, якорь перевода недели в дату (см. ниже);
+                         по умолчанию 2 и 2026-09-07. ANCHOR_MONDAY в формате YYYY-MM-DD.
 
 requirements.txt для этого сервиса:
     requests
@@ -67,13 +77,23 @@ load_dotenv()  # локально подхватит .env; на Railway файл
 
 # --- конфиг ---
 
-SUPABASE_URL = "https://pobepdbenznpdpgobwli.supabase.co".rstrip("/")
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBvYmVwZGJlbnpucGRwZ29id2xpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4ODg4ODk3MywiZXhwIjoyMTA0NDY0OTczfQ.pFrVaNnhvN0F7mcfrJ1iQEVwVkoizDmwwhBVt0t-5gg"
-BUCKET = "calendar"
+def _require_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(
+            f"Не задана обязательная переменная окружения {name}. "
+            f"Укажи её в настройках хостинга (Variables / Переменные окружения)."
+        )
+    return value
+
+
+SUPABASE_URL = _require_env("SUPABASE_URL").rstrip("/")
+SUPABASE_KEY = _require_env("SUPABASE_SERVICE_KEY")
+BUCKET = os.getenv("BUCKET", "calendar")
 STATE_FILENAME = "schedule_state.json"  # снимок расписания для отслеживания изменений
 BASE_URL = "https://raspisanie.rusoil.net"
-GROUP_NAME = "БЦШ02-26-02"
-GROUP_ID = 163685
+GROUP_NAME = _require_env("GROUP_NAME")
+GROUP_ID = int(_require_env("GROUP_ID"))
 
 # Какие файлы публикуем и как отбираем в каждый занятия.
 # key -> (имя файла в Storage, название календаря для X-WR-CALNAME, функция-фильтр по типу занятия)
@@ -93,22 +113,22 @@ def _is_lab(t: str) -> bool:
 CALENDARS = {
     "all": {
         "filename": "schedule.ics",
-        "calname": "Расписание БЦШ02-26-02",
+        "calname": f"Расписание {GROUP_NAME}",
         "filter": None,
     },
     "lectures": {
         "filename": "schedule_lectures.ics",
-        "calname": "Расписание БЦШ02-26-02 — Лекции",
+        "calname": f"Расписание {GROUP_NAME} — Лекции",
         "filter": _is_lecture,
     },
     "practice": {
         "filename": "schedule_practice.ics",
-        "calname": "Расписание БЦШ02-26-02 — Практики",
+        "calname": f"Расписание {GROUP_NAME} — Практики",
         "filter": _is_practice,
     },
     "lab": {
         "filename": "schedule_lab.ics",
-        "calname": "Расписание БЦШ02-26-02 — Лабораторные",
+        "calname": f"Расписание {GROUP_NAME} — Лабораторные",
         "filter": _is_lab,
     },
 }
@@ -132,9 +152,10 @@ NTFY_RETRY_BACKOFF_SECONDS = 3  # 3с, потом 6с, потом 9с между
 
 # Якорь для перевода "номер недели + день недели" в календарную дату.
 # 09.09.2026 — среда 2-й недели -> понедельник 2-й недели = 07.09.2026.
-# Пересчитать вручную, если сайт сбросит нумерацию недель (новый семестр).
-ANCHOR_WEEK = 2
-ANCHOR_MONDAY = date(2026, 9, 7)
+# Пересчитать вручную (и выставить новыми переменными окружения), если сайт
+# сбросит нумерацию недель (новый семестр).
+ANCHOR_WEEK = int(os.getenv("ANCHOR_WEEK", "2"))
+ANCHOR_MONDAY = date.fromisoformat(os.getenv("ANCHOR_MONDAY", "2026-09-07"))
 
 MAX_WEEK = 30
 EMPTY_WEEKS_TO_STOP = 3
@@ -247,7 +268,7 @@ def parse_dt(date_str: str, time_str: str) -> datetime:
 
 def build_ics(lessons: list[dict], calname: str) -> bytes:
     cal = Calendar()
-    cal.add("prodid", "-//BCSH02-26-02 Schedule//rusoil.net parser//RU")
+    cal.add("prodid", "-//Rusoil Schedule Bot//rusoil.net parser//RU")
     cal.add("version", "2.0")
     cal.add("X-WR-CALNAME", calname)
     cal.add("X-PUBLISHED-TTL", "PT6H")
