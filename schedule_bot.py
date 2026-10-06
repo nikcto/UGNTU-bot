@@ -1,35 +1,57 @@
 """
-Единый бот расписания.
+Единый бот расписания — поддерживает несколько групп.
 
-Каждые CHECK_INTERVAL_SECONDS (10 минут):
+Каждые CHECK_INTERVAL_SECONDS (10 минут), для КАЖДОЙ настроенной группы:
   1) забирает расписание с raspisanie.rusoil.net через внутренний API
      (обычные HTTP-запросы, без браузера)
-  2) сравнивает с предыдущим снимком расписания (хранится в Supabase Storage)
+  2) сравнивает с предыдущим снимком расписания этой группы (хранится
+     в Supabase Storage, свой снимок на каждую группу)
   3) если есть изменения — шлёт push-уведомление в ntfy (на айфон)
 
-Каждые PUBLISH_INTERVAL_SECONDS (1 час):
+Каждые PUBLISH_INTERVAL_SECONDS (1 час) на группу (или сразу при изменении):
   4) собирает .ics и кладёт в публичный бакет Supabase Storage — сразу
-     ЧЕТЫРЕ отдельных файла: общий + по одному на лекции/практики/лабы.
-     Разные файлы = разные подписки в календаре = разные цвета на айфоне.
+     ЧЕТЫРЕ отдельных файла на эту группу: общий + по одному на
+     лекции/практики/лабы. Разные файлы = разные подписки в календаре =
+     разные цвета на айфоне.
 
 При запуске бот сразу шлёт уведомление "работаю, всё збс" (в NTFY_ADMIN_TOPIC).
 
+--- Группы и ИМЕНА ФАЙЛОВ (важно!) ---
+Первая/основная группа задаётся как раньше, через GROUP_NAME/GROUP_ID, и её
+файлы называются БЕЗ ПРЕФИКСА — ровно так же, как до появления поддержки
+нескольких групп (schedule.ics, schedule_lectures.ics, schedule_practice.ics,
+schedule_lab.ics). Те, кто уже подписался на эти ссылки в своём календаре,
+ничего менять не должны — ссылки не меняются.
+
+Любые ДОПОЛНИТЕЛЬНЫЕ группы задаются через EXTRA_GROUPS и получают файлы
+С ПРЕФИКСОМ (slug_schedule.ics и т.д.) — у каждой группы свой набор из 4
+файлов, не пересекающийся с основной группой и с другими дополнительными.
+
 Нужные переменные окружения (задаются на хостинге — bothost/Railway — в
 разделе Variables/Переменные окружения; локально можно положить в .env):
-    SUPABASE_URL       — обязательно. Адрес проекта, вида https://xxx.supabase.co
+    SUPABASE_URL         — обязательно. Адрес проекта, вида https://xxx.supabase.co
     SUPABASE_SERVICE_KEY — обязательно. service_role JWT-ключ (не sb_secret_...,
-                         см. Project Settings -> JWT Keys -> Legacy JWT Secret ->
-                         "Go to API keys", там service_role в виде eyJ...).
-    GROUP_NAME         — обязательно. Название группы как на сайте, например БЦШ02-26-02
-    GROUP_ID           — обязательно. id группы (число из search-параметра сайта)
-    NTFY_TOPIC         — публичный топик: изменения расписания, на него подписаны все
-    NTFY_ADMIN_TOPIC   — приватный топик только для тебя: старт бота, ошибки.
-                         Если не задать — эти сообщения просто не отправляются никуда
-                         (тихо оседают в логах), в публичный топик они НЕ упадут.
-    NTFY_SERVER        — опционально, свой сервер ntfy; по умолчанию https://ntfy.sh
-    BUCKET             — опционально, имя бакета в Supabase Storage; по умолчанию calendar
+                           см. Project Settings -> JWT Keys -> Legacy JWT Secret ->
+                           "Go to API keys", там service_role в виде eyJ...).
+    GROUP_NAME           — обязательно. Основная группа, название как на сайте,
+                           например БЦШ02-26-02. Её файлы — без префикса (см. выше).
+    GROUP_ID             — обязательно. id основной группы (число из search-параметра сайта).
+    EXTRA_GROUPS         — опционально. Дополнительные группы, формат:
+                           Название:id:slug,Название:id:slug,...
+                           slug — короткий ярлык латиницей/цифрами (a-z, 0-9, _, -),
+                           он идёт префиксом в именах файлов этой группы, например:
+                           EXTRA_GROUPS=БНИ-26-01:157710:bni2601
+                           -> файлы bni2601_schedule.ics, bni2601_schedule_lectures.ics, ...
+                           Несколько групп разделяются запятой.
+    NTFY_TOPIC           — публичный топик: изменения расписания, на него подписаны все
+    NTFY_ADMIN_TOPIC     — приватный топик только для тебя: старт бота, ошибки.
+                           Если не задать — эти сообщения просто не отправляются никуда
+                           (тихо оседают в логах), в публичный топик они НЕ упадут.
+    NTFY_SERVER          — опционально, свой сервер ntfy; по умолчанию https://ntfy.sh
+    BUCKET               — опционально, имя бакета в Supabase Storage; по умолчанию calendar
     ANCHOR_WEEK, ANCHOR_MONDAY — опционально, якорь перевода недели в дату (см. ниже);
-                         по умолчанию 2 и 2026-09-07. ANCHOR_MONDAY в формате YYYY-MM-DD.
+                           по умолчанию 2 и 2026-09-07. ANCHOR_MONDAY в формате YYYY-MM-DD.
+                           Общий для всех групп (все группы одного вуза, один учебный график).
 
 requirements.txt для этого сервиса:
     requests
@@ -44,22 +66,18 @@ IANA больше нет, она давно объединена с екатер
 tzdata в requirements.txt — на Windows без него зоны не резолвятся.
 
 --- Отдельные календари по типу занятия ---
-Раньше публиковался один файл schedule.ics со всем расписанием. Теперь
-дополнительно публикуются ещё три файла — только с лекциями / только с
-практиками / только с лабами (см. CALENDARS ниже). Смысл: подписной
+На каждую группу публикуется не один файл, а четыре — общий + только с
+лекциями / только с практиками / только с лабами. Смысл: подписной
 календарь в приложении "Календарь" на iPhone красится ЦЕЛИКОМ одним цветом
 — разным цветом можно покрасить только РАЗНЫЕ подписки. Разбив расписание
 на 4 файла и подписавшись на каждый отдельно, можно каждому назначить свой
 цвет (например, лекции — синим, практики — зелёным, лабы — оранжевым).
-Общий файл (schedule.ics) можно держать как резервный/для тех, кому не
-важны цвета — он никуда не делся, просто перестал быть единственным.
 
 Тип занятия (поле NVIDZANAT с сайта) распознаётся по подстроке в названии
 (регистронезависимо): "лекц" -> лекции, "практ" -> практики, "лаб" -> лабы.
 Если сайт вдруг начнёт присылать тип, не попадающий ни под одну из этих
 подстрок (например "консультация", "экзамен") — такое занятие попадёт
-только в общий файл, в тематические не попадёт. Если понадобится завести
-под это отдельный календарь — добавьте ещё один элемент в CALENDARS ниже.
+только в общий файл, в тематические не попадёт.
 """
 import json
 import os
@@ -90,55 +108,14 @@ def _require_env(name: str) -> str:
 SUPABASE_URL = _require_env("SUPABASE_URL").rstrip("/")
 SUPABASE_KEY = _require_env("SUPABASE_SERVICE_KEY")
 BUCKET = os.getenv("BUCKET", "calendar")
-STATE_FILENAME = "schedule_state.json"  # снимок расписания для отслеживания изменений
 BASE_URL = "https://raspisanie.rusoil.net"
-GROUP_NAME = _require_env("GROUP_NAME")
-GROUP_ID = int(_require_env("GROUP_ID"))
-
-# Какие файлы публикуем и как отбираем в каждый занятия.
-# key -> (имя файла в Storage, название календаря для X-WR-CALNAME, функция-фильтр по типу занятия)
-# filter_fn=None означает "все занятия без разбора" (общий файл).
-def _is_lecture(t: str) -> bool:
-    return "лекц" in t.lower()
-
-
-def _is_practice(t: str) -> bool:
-    return "практ" in t.lower()
-
-
-def _is_lab(t: str) -> bool:
-    return "лаб" in t.lower()
-
-
-CALENDARS = {
-    "all": {
-        "filename": "schedule.ics",
-        "calname": f"Расписание {GROUP_NAME}",
-        "filter": None,
-    },
-    "lectures": {
-        "filename": "schedule_lectures.ics",
-        "calname": f"Расписание {GROUP_NAME} — Лекции",
-        "filter": _is_lecture,
-    },
-    "practice": {
-        "filename": "schedule_practice.ics",
-        "calname": f"Расписание {GROUP_NAME} — Практики",
-        "filter": _is_practice,
-    },
-    "lab": {
-        "filename": "schedule_lab.ics",
-        "calname": f"Расписание {GROUP_NAME} — Лабораторные",
-        "filter": _is_lab,
-    },
-}
 
 # Часовой пояс, в котором на самом деле проходят пары (Уфа = Екатеринбургское время, UTC+5).
 LESSON_TZ = ZoneInfo("Asia/Yekaterinburg")
 
 # ntfy — сюда шлём push-уведомления на телефон.
 # NTFY_TOPIC — публичный топик, на него подписаны все, кто пользуется календарём:
-#              сюда идут только уведомления об изменениях в расписании.
+#              сюда идут только уведомления об изменениях в расписании (для всех групп).
 # NTFY_ADMIN_TOPIC — отдельный приватный топик только для тебя: сюда идут
 #              техническое: старт бота, ошибки. Если не задать —
 #              эти уведомления просто не отправляются никуда (тихо оседают в логах),
@@ -153,17 +130,17 @@ NTFY_RETRY_BACKOFF_SECONDS = 3  # 3с, потом 6с, потом 9с между
 # Якорь для перевода "номер недели + день недели" в календарную дату.
 # 09.09.2026 — среда 2-й недели -> понедельник 2-й недели = 07.09.2026.
 # Пересчитать вручную (и выставить новыми переменными окружения), если сайт
-# сбросит нумерацию недель (новый семестр).
+# сбросит нумерацию недель (новый семестр). Общий для всех групп.
 ANCHOR_WEEK = int(os.getenv("ANCHOR_WEEK", "2"))
 ANCHOR_MONDAY = date.fromisoformat(os.getenv("ANCHOR_MONDAY", "2026-09-07"))
 
 MAX_WEEK = 30
 EMPTY_WEEKS_TO_STOP = 3
 CHECK_INTERVAL_SECONDS = 10 * 60  # проверка изменений расписания — каждые 10 минут
-PUBLISH_INTERVAL_SECONDS = 60 * 60  # обновление .ics в Supabase — раз в час
+PUBLISH_INTERVAL_SECONDS = 60 * 60  # обновление .ics в Supabase — раз в час (на группу)
 REQUEST_TIMEOUT_SECONDS = 20  # общий таймаут для запросов к сайту/Supabase
 
-SCHEDULE_LOCK = threading.Lock()  # чтобы плановая проверка и ручной запуск не пересекались
+SCHEDULE_LOCK = threading.Lock()  # чтобы публикации разных групп не пересекались в Storage
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/155.0",
@@ -171,17 +148,123 @@ HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded",
 }
 
+
+# --- группы ---
+
+def _is_lecture(t: str) -> bool:
+    return "лекц" in t.lower()
+
+
+def _is_practice(t: str) -> bool:
+    return "практ" in t.lower()
+
+
+def _is_lab(t: str) -> bool:
+    return "лаб" in t.lower()
+
+
+_TYPE_FILTERS = {
+    "lectures": ("Лекции", _is_lecture),
+    "practice": ("Практики", _is_practice),
+    "lab": ("Лабораторные", _is_lab),
+}
+
+
+def build_calendars(name: str, filename_prefix: str) -> dict:
+    """filename_prefix='' -> старые имена файлов без изменений (основная группа).
+    filename_prefix='slug_' -> имена файлов с префиксом (дополнительные группы)."""
+    calendars = {
+        "all": {
+            "filename": f"{filename_prefix}schedule.ics",
+            "calname": f"Расписание {name}",
+            "filter": None,
+        }
+    }
+    for key, (label, filter_fn) in _TYPE_FILTERS.items():
+        calendars[key] = {
+            "filename": f"{filename_prefix}schedule_{key}.ics",
+            "calname": f"Расписание {name} — {label}",
+            "filter": filter_fn,
+        }
+    return calendars
+
+
+_SLUG_RE_ALLOWED = set("abcdefghijklmnopqrstuvwxyz0123456789_-")
+
+
+def _validate_slug(slug: str, raw_entry: str) -> None:
+    if not slug or any(ch.lower() not in _SLUG_RE_ALLOWED for ch in slug):
+        raise RuntimeError(
+            f"EXTRA_GROUPS: некорректный slug {slug!r} в записи {raw_entry!r}. "
+            f"slug может содержать только латинские буквы, цифры, '_' и '-'."
+        )
+
+
+def parse_groups() -> list[dict]:
+    """Основная группа (GROUP_NAME/GROUP_ID) всегда идёт первой, с префиксом ''
+    (старые имена файлов, ничего не меняется для текущих подписчиков).
+    Дополнительные группы из EXTRA_GROUPS добавляются следом, с префиксом
+    '<slug>_' в именах файлов и отдельным снимком состояния."""
+    primary_name = _require_env("GROUP_NAME")
+    primary_id = int(_require_env("GROUP_ID"))
+
+    groups = [
+        {
+            "name": primary_name,
+            "id": primary_id,
+            "state_filename": "schedule_state.json",
+            "calendars": build_calendars(primary_name, ""),
+            "label": primary_name,  # для логов/уведомлений
+        }
+    ]
+
+    extra_raw = os.environ.get("EXTRA_GROUPS", "").strip()
+    if extra_raw:
+        seen_slugs = set()
+        for entry in extra_raw.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            parts = entry.split(":")
+            if len(parts) != 3:
+                raise RuntimeError(
+                    f"EXTRA_GROUPS: неверный формат записи {entry!r}, "
+                    f"ожидается Название:id:slug"
+                )
+            name, gid_str, slug = (p.strip() for p in parts)
+            _validate_slug(slug, entry)
+            if slug in seen_slugs:
+                raise RuntimeError(f"EXTRA_GROUPS: повторяющийся slug {slug!r}")
+            seen_slugs.add(slug)
+            try:
+                gid = int(gid_str)
+            except ValueError:
+                raise RuntimeError(f"EXTRA_GROUPS: id должен быть числом в записи {entry!r}")
+
+            groups.append(
+                {
+                    "name": name,
+                    "id": gid,
+                    "state_filename": f"{slug}_schedule_state.json",
+                    "calendars": build_calendars(name, f"{slug}_"),
+                    "label": name,
+                }
+            )
+
+    return groups
+
+
 # --- шаг 1: скрейпинг ---
 
-def make_session() -> requests.Session:
+def make_session(group_name: str, group_id: int) -> requests.Session:
     session = requests.Session()
     session.headers.update(HEADERS)
     search_param = json.dumps(
         {
-            "value": GROUP_NAME,
-            "id": GROUP_ID,
+            "value": group_name,
+            "id": group_id,
             "FILIAL": 1,
-            "GRUPPA": GROUP_NAME,
+            "GRUPPA": group_name,
             "BELLFAK": 1,
             "FOB": 1,
         },
@@ -196,8 +279,8 @@ def make_session() -> requests.Session:
     return session
 
 
-def fetch_week_raw(session: requests.Session, week: int) -> list[dict]:
-    payload = json.dumps({"gruppa": GROUP_NAME, "beginweek": week, "endweek": week}, ensure_ascii=False)
+def fetch_week_raw(session: requests.Session, group_name: str, week: int) -> list[dict]:
+    payload = json.dumps({"gruppa": group_name, "beginweek": week, "endweek": week}, ensure_ascii=False)
     resp = session.post(
         f"{BASE_URL}/origins/get_rasp_student",
         data=payload.encode("utf-8"),
@@ -237,13 +320,13 @@ def transform(raw_lessons: list[dict], week: int) -> list[dict]:
     return out
 
 
-def fetch_all_lessons() -> list[dict]:
-    session = make_session()
+def fetch_all_lessons(group_name: str, group_id: int) -> list[dict]:
+    session = make_session(group_name, group_id)
     all_lessons: list[dict] = []
     empty_streak = 0
 
     for week in range(1, MAX_WEEK + 1):
-        raw = fetch_week_raw(session, week)
+        raw = fetch_week_raw(session, group_name, week)
         if not raw:
             empty_streak += 1
             if empty_streak >= EMPTY_WEEKS_TO_STOP:
@@ -259,9 +342,8 @@ def fetch_all_lessons() -> list[dict]:
 
 def parse_dt(date_str: str, time_str: str) -> datetime:
     """Возвращает datetime с явно проставленным часовым поясом Уфы (UTC+5).
-    Раньше здесь возвращался "голый" datetime без tzinfo — из-за этого каждый
-    календарь трактовал время как СВОЁ локальное, и у людей в другом поясе
-    пары показывались не в то время."""
+    "Голый" datetime без tzinfo каждый календарь трактует как своё локальное
+    время — у людей в другом поясе пары показывались бы не в то время."""
     naive = datetime.strptime(f"{date_str} {time_str}", "%d.%m.%Y %H:%M")
     return naive.replace(tzinfo=LESSON_TZ)
 
@@ -311,11 +393,11 @@ def publish_file(filename: str, data: bytes, content_type: str) -> str:
     return f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{filename}"
 
 
-def publish_all_calendars(lessons: list[dict]) -> dict[str, str]:
-    """Собирает и публикует все файлы из CALENDARS (общий + по типам занятий).
+def publish_all_calendars(group: dict, lessons: list[dict]) -> dict[str, str]:
+    """Собирает и публикует все файлы группы (общий + по типам занятий).
     Возвращает {ключ_календаря: публичная_ссылка}."""
     urls: dict[str, str] = {}
-    for key, cfg in CALENDARS.items():
+    for key, cfg in group["calendars"].items():
         filter_fn = cfg["filter"]
         subset = lessons if filter_fn is None else [l for l in lessons if filter_fn(l["type"])]
         ics_bytes = build_ics(subset, cfg["calname"])
@@ -325,8 +407,8 @@ def publish_all_calendars(lessons: list[dict]) -> dict[str, str]:
 
 # --- шаг 4: снимок расписания в Supabase Storage (для отслеживания изменений) ---
 
-def fetch_state() -> dict[str, dict]:
-    url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{STATE_FILENAME}"
+def fetch_state(group: dict) -> dict[str, dict]:
+    url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{group['state_filename']}"
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
 
@@ -340,8 +422,8 @@ def fetch_state() -> dict[str, dict]:
     return {lesson["uid"]: lesson for lesson in lessons}
 
 
-def save_state(lessons: list[dict]) -> None:
-    upload_url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{STATE_FILENAME}"
+def save_state(group: dict, lessons: list[dict]) -> None:
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{group['state_filename']}"
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -453,81 +535,87 @@ def send_ntfy(text: str, title: str | None = None, priority: int = 3, tags: list
     return all_ok
 
 
+# --- шаг 6: обработка одной группы за один цикл ---
+
+def check_group_for_changes(group: dict) -> tuple[list[dict], bool]:
+    """Забирает текущее расписание ОДНОЙ группы, сравнивает с её снимком,
+    уведомляет об изменениях и, если расписание реально изменилось, сразу же
+    публикует все .ics этой группы (не дожидаясь часового цикла публикации)."""
+    lessons = fetch_all_lessons(group["name"], group["id"])
+    curr_state = {lesson["uid"]: lesson for lesson in lessons}
+    prev_state = fetch_state(group)
+
+    if prev_state:  # не спамим уведомлением при первом запуске / пустом снимке
+        diff_lines = compute_diff(prev_state, curr_state)
+        if diff_lines:
+            title = f"Изменения в расписании ({group['label']})"
+            send_ntfy("\n".join(diff_lines), title=title, priority=4, tags=["calendar"])
+            print(f"[{group['label']}] Найдено изменений: {len(diff_lines)}")
+
+    changed = curr_state != prev_state
+    if changed:
+        save_state(group, lessons)
+        urls = publish_all_calendars(group, lessons)
+        print(f"[{group['label']}] Расписание изменилось, .ics опубликованы немедленно:")
+        for key, url in urls.items():
+            print(f"  {key}: {url}")
+
+    return lessons, changed
+
+
 # --- цикл ---
 
-def check_for_changes() -> tuple[list[dict], list[str], bool]:
-    """Забирает текущее расписание, сравнивает с сохранённым снимком, уведомляет об
-    изменениях и, если расписание реально изменилось, сразу же публикует все .ics
-    (не дожидаясь часового цикла публикации) — чтобы календари на телефоне обновлялись
-    практически сразу после обнаружения изменения, а не с задержкой до часа."""
-    with SCHEDULE_LOCK:
-        lessons = fetch_all_lessons()
-        curr_state = {lesson["uid"]: lesson for lesson in lessons}
-        prev_state = fetch_state()
-
-        diff_lines: list[str] = []
-        if prev_state:  # не спамим уведомлением при первом запуске / пустом снимке
-            diff_lines = compute_diff(prev_state, curr_state)
-            if diff_lines:
-                send_ntfy(
-                    "\n".join(diff_lines),
-                    title="Изменения в расписании",
-                    priority=4,
-                    tags=["calendar"],
-                )
-                print(f"Найдено изменений: {len(diff_lines)}")
-
-        changed = curr_state != prev_state
-        if changed:
-            save_state(lessons)
-            # Расписание изменилось — публикуем все .ics сразу, не дожидаясь часового таймера.
-            urls = publish_all_calendars(lessons)
-            print("Расписание изменилось, .ics опубликованы немедленно:")
-            for key, url in urls.items():
-                print(f"  {key}: {url}")
-
-        return lessons, diff_lines, changed
-
-
-# --- шаг 6: цикл ---
-
 def main() -> None:
+    groups = parse_groups()
+    group_names = ", ".join(g["label"] for g in groups)
+    print(f"Бот запущен. Группы: {group_names}")
+
     send_ntfy(
-        "Бот расписания запущен и работает — всё збс.",
+        f"Бот расписания запущен и работает — всё збс. Группы: {group_names}",
         title="Бот в строю ✅",
         tags=["rocket"],
         topic=NTFY_ADMIN_TOPIC,
     )
 
-    last_publish = 0.0
-    while True:
-        try:
-            lessons, _, changed = check_for_changes()
-            now = time.monotonic()
+    last_publish: dict[str, float] = {}
 
-            if changed:
-                # check_for_changes() уже опубликовал все .ics немедленно — просто
-                # сбрасываем часовой таймер, чтобы не публиковать то же самое дважды подряд.
-                last_publish = now
-            elif now - last_publish >= PUBLISH_INTERVAL_SECONDS:
-                # Изменений не было, но раз в час всё равно republish-имся на всякий
-                # случай (защита от рассинхрона, если что-то пошло не так раньше).
-                with SCHEDULE_LOCK:
-                    urls = publish_all_calendars(lessons)
-                print(f"Опубликовано {len(lessons)} занятий:")
-                for key, url in urls.items():
-                    print(f"  {key}: {url}")
-                last_publish = now
-        except Exception as e:
-            # Ошибки в основном цикле идут только тебе в админский топик, а не в
-            # публичный — остальные подписчики никогда их не увидят. Если
-            # NTFY_ADMIN_TOPIC не задан, send_ntfy сама тихо пропустит отправку
-            # и просто напечатает сообщение в лог.
-            print(f"Ошибка в основном цикле: {e}")
+    while True:
+        for group in groups:
             try:
-                send_ntfy(f"⚠️ {e}", title="Ошибка бота", priority=4, tags=["warning"], topic=NTFY_ADMIN_TOPIC)
-            except Exception as notify_error:
-                print(f"Не удалось даже уведомить об ошибке: {notify_error}")
+                with SCHEDULE_LOCK:
+                    lessons, changed = check_group_for_changes(group)
+                now = time.monotonic()
+
+                if changed:
+                    # Уже опубликовано немедленно внутри check_group_for_changes —
+                    # просто сбрасываем часовой таймер этой группы.
+                    last_publish[group["label"]] = now
+                elif now - last_publish.get(group["label"], 0.0) >= PUBLISH_INTERVAL_SECONDS:
+                    # Изменений не было, но раз в час всё равно republish-имся на всякий
+                    # случай (защита от рассинхрона, если что-то пошло не так раньше).
+                    with SCHEDULE_LOCK:
+                        urls = publish_all_calendars(group, lessons)
+                    print(f"[{group['label']}] Опубликовано {len(lessons)} занятий:")
+                    for key, url in urls.items():
+                        print(f"  {key}: {url}")
+                    last_publish[group["label"]] = now
+            except Exception as e:
+                # Ошибки по одной группе идут только тебе в админский топик, а не в
+                # публичный — остальные подписчики никогда их не увидят. Если
+                # NTFY_ADMIN_TOPIC не задан, send_ntfy сама тихо пропустит отправку
+                # и просто напечатает сообщение в лог. Ошибка по одной группе не
+                # прерывает обработку остальных групп в этом же цикле.
+                print(f"[{group['label']}] Ошибка: {e}")
+                try:
+                    send_ntfy(
+                        f"⚠️ [{group['label']}] {e}",
+                        title="Ошибка бота",
+                        priority=4,
+                        tags=["warning"],
+                        topic=NTFY_ADMIN_TOPIC,
+                    )
+                except Exception as notify_error:
+                    print(f"Не удалось даже уведомить об ошибке: {notify_error}")
 
         time.sleep(CHECK_INTERVAL_SECONDS)
 
