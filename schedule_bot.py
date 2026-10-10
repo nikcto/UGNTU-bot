@@ -127,6 +127,15 @@ NTFY_TIMEOUT_SECONDS = 10
 NTFY_MAX_ATTEMPTS = 3
 NTFY_RETRY_BACKOFF_SECONDS = 3  # 3с, потом 6с, потом 9с между попытками
 
+# Публичные push-уведомления об изменениях расписания (в NTFY_TOPIC) шлём
+# только для ОСНОВНОЙ группы — её подписчики и так ждут эти уведомления.
+# Дополнительные группы (EXTRA_GROUPS) по умолчанию НЕ шлют публичных
+# уведомлений (чтобы не спамить в чужой топик), но их .ics всё равно
+# считаются и публикуются как обычно. Поставь NOTIFY_EXTRA_GROUPS=1 в
+# переменных окружения, если хочешь, чтобы и доп. группы тоже слали
+# уведомления в тот же NTFY_TOPIC.
+NOTIFY_EXTRA_GROUPS = os.getenv("NOTIFY_EXTRA_GROUPS", "0").strip() == "1"
+
 # Якорь для перевода "номер недели + день недели" в календарную дату.
 # 09.09.2026 — среда 2-й недели -> понедельник 2-й недели = 07.09.2026.
 # Пересчитать вручную (и выставить новыми переменными окружения), если сайт
@@ -215,6 +224,7 @@ def parse_groups() -> list[dict]:
             "state_filename": "schedule_state.json",
             "calendars": build_calendars(primary_name, ""),
             "label": primary_name,  # для логов/уведомлений
+            "notify": True,  # публичные push-уведомления об изменениях шлём только для основной группы
         }
     ]
 
@@ -248,6 +258,11 @@ def parse_groups() -> list[dict]:
                     "state_filename": f"{slug}_schedule_state.json",
                     "calendars": build_calendars(name, f"{slug}_"),
                     "label": name,
+                    # дополнительные группы НЕ шлют публичные push-уведомления в NTFY_TOPIC
+                    # (на него подписана аудитория основной группы) — только считают диффы
+                    # и публикуют .ics; при желании включить уведомления и для них, см.
+                    # комментарий у NOTIFY_EXTRA_GROUPS ниже.
+                    "notify": NOTIFY_EXTRA_GROUPS,
                 }
             )
 
@@ -548,8 +563,9 @@ def check_group_for_changes(group: dict) -> tuple[list[dict], bool]:
     if prev_state:  # не спамим уведомлением при первом запуске / пустом снимке
         diff_lines = compute_diff(prev_state, curr_state)
         if diff_lines:
-            title = f"Изменения в расписании ({group['label']})"
-            send_ntfy("\n".join(diff_lines), title=title, priority=4, tags=["calendar"])
+            if group.get("notify", True):
+                title = f"Изменения в расписании ({group['label']})"
+                send_ntfy("\n".join(diff_lines), title=title, priority=4, tags=["calendar"])
             print(f"[{group['label']}] Найдено изменений: {len(diff_lines)}")
 
     changed = curr_state != prev_state
