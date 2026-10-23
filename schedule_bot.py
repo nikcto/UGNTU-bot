@@ -626,7 +626,7 @@ def main() -> None:
     print(f"Бот запущен. Группы: {group_names}")
 
     send_ntfy(
-        f"Бот расписания запущен и работает — всё збс. Группы: {group_names}",
+        f"Бот расписания запущен и работает — всё збз. Группы: {group_names}",
         title="Бот в строю ✅",
         tags=["rocket"],
         topic=NTFY_ADMIN_TOPIC,
