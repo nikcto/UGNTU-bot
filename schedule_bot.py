@@ -114,8 +114,7 @@ BASE_URL = "https://raspisanie.rusoil.net"
 LESSON_TZ = ZoneInfo("Asia/Yekaterinburg")
 
 # ntfy — сюда шлём push-уведомления на телефон.
-# NTFY_TOPIC — публичный топик, на него подписаны все, кто пользуется календарём:
-#              сюда идут только уведомления об изменениях в расписании (для всех групп).
+# NTFY_TOPIC — публичный топик уведомлений об изменениях расписания БЦШ.
 # NTFY_ADMIN_TOPIC — отдельный приватный топик только для тебя: сюда идут
 #              техническое: старт бота, ошибки. Если не задать —
 #              эти уведомления просто не отправляются никуда (тихо оседают в логах),
@@ -127,14 +126,11 @@ NTFY_TIMEOUT_SECONDS = 10
 NTFY_MAX_ATTEMPTS = 3
 NTFY_RETRY_BACKOFF_SECONDS = 3  # 3с, потом 6с, потом 9с между попытками
 
-# Публичные push-уведомления об изменениях расписания (в NTFY_TOPIC) шлём
-# только для ОСНОВНОЙ группы — её подписчики и так ждут эти уведомления.
-# Дополнительные группы (EXTRA_GROUPS) по умолчанию НЕ шлют публичных
-# уведомлений (чтобы не спамить в чужой топик), но их .ics всё равно
-# считаются и публикуются как обычно. Поставь NOTIFY_EXTRA_GROUPS=1 в
-# переменных окружения, если хочешь, чтобы и доп. группы тоже слали
-# уведомления в тот же NTFY_TOPIC.
-NOTIFY_EXTRA_GROUPS = os.getenv("NOTIFY_EXTRA_GROUPS", "0").strip() == "1"
+# Публичные push-уведомления об изменениях расписания отправляем только для
+# группы БЦШ. Это намеренно проверяется по названию группы, а не по тому,
+# является ли она основной: подписной календарь при этом по-прежнему строится
+# для всех групп, включая БЭГ.
+NOTIFY_GROUP_MARKER = "БЦШ"
 
 # Якорь для перевода "номер недели + день недели" в календарную дату.
 # 09.09.2026 — среда 2-й недели -> понедельник 2-й недели = 07.09.2026.
@@ -209,6 +205,15 @@ def _validate_slug(slug: str, raw_entry: str) -> None:
         )
 
 
+def should_notify_group(group_name: str) -> bool:
+    """Разрешает push-уведомления только группам БЦШ.
+
+    .ics публикуются отдельно и для БЦШ, и для БЭГ — эта функция относится
+    только к публичным уведомлениям об изменениях расписания.
+    """
+    return NOTIFY_GROUP_MARKER in group_name.upper()
+
+
 def parse_groups() -> list[dict]:
     """Основная группа (GROUP_NAME/GROUP_ID) всегда идёт первой, с префиксом ''
     (старые имена файлов, ничего не меняется для текущих подписчиков).
@@ -224,7 +229,7 @@ def parse_groups() -> list[dict]:
             "state_filename": "schedule_state.json",
             "calendars": build_calendars(primary_name, ""),
             "label": primary_name,  # для логов/уведомлений
-            "notify": True,  # публичные push-уведомления об изменениях шлём только для основной группы
+            "notify": should_notify_group(primary_name),
         }
     ]
 
@@ -258,11 +263,9 @@ def parse_groups() -> list[dict]:
                     "state_filename": f"{slug}_schedule_state.json",
                     "calendars": build_calendars(name, f"{slug}_"),
                     "label": name,
-                    # дополнительные группы НЕ шлют публичные push-уведомления в NTFY_TOPIC
-                    # (на него подписана аудитория основной группы) — только считают диффы
-                    # и публикуют .ics; при желании включить уведомления и для них, см.
-                    # комментарий у NOTIFY_EXTRA_GROUPS ниже.
-                    "notify": NOTIFY_EXTRA_GROUPS,
+                    # БЭГ и любые другие группы не шлют push-уведомления, но
+                    # их подписные календари всё равно публикуются.
+                    "notify": should_notify_group(name),
                 }
             )
 
@@ -458,8 +461,27 @@ def save_state(group: dict, lessons: list[dict]) -> None:
 
 # --- шаг 5: сравнение расписаний и push-уведомления в ntfy ---
 
-def format_lesson(lesson: dict) -> str:
-    parts = [lesson["date"], lesson["time"], f"{lesson['subject']} ({lesson['type']})"]
+def notification_period(lesson_date: date, today: date) -> str | None:
+    """Возвращает подпись для push или None, если дата не подходит."""
+    days_from_today = (lesson_date - today).days
+    if days_from_today < 0 or days_from_today > 7:
+        return None
+    if days_from_today == 0:
+        return "сегодня"
+    if days_from_today == 1:
+        return "завтра"
+
+    if lesson_date.isocalendar()[:2] == today.isocalendar()[:2]:
+        return "на этой неделе"
+    return "на следующей неделе"
+
+
+def format_notification_lesson(lesson: dict, today: date) -> str:
+    """Форматирует занятие для push с относительной датой."""
+    lesson_date = datetime.strptime(lesson["date"], "%d.%m.%Y").date()
+    period = notification_period(lesson_date, today)
+    date_label = lesson["date"] if period is None else f"{lesson['date']} ({period})"
+    parts = [date_label, lesson["time"], f"{lesson['subject']} ({lesson['type']})"]
     if lesson.get("teacher"):
         parts.append(lesson["teacher"])
     if lesson.get("room"):
@@ -467,23 +489,40 @@ def format_lesson(lesson: dict) -> str:
     return " | ".join(parts)
 
 
-def compute_diff(prev: dict[str, dict], curr: dict[str, dict]) -> list[str]:
+def compute_diff(
+    prev: dict[str, dict], curr: dict[str, dict], today: date | None = None
+) -> list[str]:
+    """Возвращает изменения только от сегодня до сегодня + 7 дней."""
+    today = today or datetime.now(LESSON_TZ).date()
     lines: list[str] = []
 
     added = sorted(curr.keys() - prev.keys(), key=lambda u: (curr[u]["date"], curr[u]["time"]))
     for uid in added:
-        lines.append(f"➕ Добавлено: {format_lesson(curr[uid])}")
+        lesson = curr[uid]
+        lesson_date = datetime.strptime(lesson["date"], "%d.%m.%Y").date()
+        if notification_period(lesson_date, today) is not None:
+            lines.append(f"➕ Добавлено: {format_notification_lesson(lesson, today)}")
 
     removed = sorted(prev.keys() - curr.keys(), key=lambda u: (prev[u]["date"], prev[u]["time"]))
     for uid in removed:
-        lines.append(f"➖ Отменено: {format_lesson(prev[uid])}")
+        lesson = prev[uid]
+        lesson_date = datetime.strptime(lesson["date"], "%d.%m.%Y").date()
+        if notification_period(lesson_date, today) is not None:
+            lines.append(f"➖ Отменено: {format_notification_lesson(lesson, today)}")
 
     changed = sorted(
         (uid for uid in curr.keys() & prev.keys() if curr[uid] != prev[uid]),
         key=lambda u: (curr[u]["date"], curr[u]["time"]),
     )
     for uid in changed:
-        lines.append(f"✏️ Изменено:\n   было: {format_lesson(prev[uid])}\n   стало: {format_lesson(curr[uid])}")
+        lesson = curr[uid]
+        lesson_date = datetime.strptime(lesson["date"], "%d.%m.%Y").date()
+        if notification_period(lesson_date, today) is not None:
+            lines.append(
+                f"✏️ Изменено:\n"
+                f"   было: {format_notification_lesson(prev[uid], today)}\n"
+                f"   стало: {format_notification_lesson(lesson, today)}"
+            )
 
     return lines
 
